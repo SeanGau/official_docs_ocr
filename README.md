@@ -63,7 +63,7 @@ python3 ocr_doc.py -i in/ -o out/
 python3 ocr_doc_local.py
 python3 ocr_doc_local.py --base-url http://172.17.224.1:1234/v1
 python3 ocr_doc_local.py --model qwen2.5-vl-7b-instruct --dpi 180
-python3 ocr_doc_local.py --meta-model qwen3.5-9b   # OCR 專用模型要另外指定文字模型
+python3 ocr_doc_local.py --model "allenai/olmocr-2-7b" --meta-model "gemma-4-e4b-it"
 python3 ocr_doc_local.py --no-meta                 # 只要內文
 ```
 
