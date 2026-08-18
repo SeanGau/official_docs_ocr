@@ -28,6 +28,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -100,6 +101,11 @@ META_SCHEMA = {
 # 用 regex 抓；交給 4B 級小模型判斷實測三份全錯（''、「說明」、「N/A」）。
 DOC_TYPES = ("開會通知單", "書函", "公告", "移文單", "報告", "函", "令", "簽")
 
+# 主旨同樣位置固定：「主旨：」起、「說明：」或空行止。實測 gemma-4-e4b-it 會在
+# 後面黏上自評（「(註：原文結尾為…)」），qwen3.5-9b 則有時把整段說明吞進來，
+# 兩個模型都髒過，所以能用 regex 抓就不要問模型。
+SUBJECT_RE = re.compile(r"主旨[：:]\s*(.+?)(?=\n\s*\n|\n?\s*說明[：:]|$)", re.S)
+
 
 def render_pages(pdf_path: Path, dpi: int, max_edge: int) -> list[bytes]:
     """把 PDF 每頁 render 成 PNG bytes，長邊不超過 max_edge。"""
@@ -119,9 +125,10 @@ def image_part(png: bytes) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
 
 
-# metadata 只有 5 個短欄位，給小額度就好；不吃 json_schema 的模型會很快撞上限
-# 而不是硬生幾千個 token 才失敗。
-META_MAX_TOKENS = 512
+# 欄位雖然短，但 meta model 多半是 reasoning 模型，額度要含 thinking 的量。
+# 實測 gemma-4-e4b-it 約 800、qwen3.5-9b 要到 6000 才把 8 個欄位抽完；
+# 給太少不會報「答錯」，而是 content 空掉、metadata 整份抽不到。
+META_MAX_TOKENS = 8192
 PAGE_MAX_TOKENS = 4096
 
 
@@ -157,6 +164,13 @@ def ask(
     content = (choice.message.content or "").strip()
     reasoning = (getattr(choice.message, "reasoning_content", None) or "").strip()
 
+    # 截斷要最先判掉。thinking 被切一半時，下面那段 fallback 會把殘缺的 JSON
+    # 當成答案回傳，錯誤最後才在 json.loads 爆成看不懂的 JSONDecodeError。
+    if choice.finish_reason == "length":
+        used = getattr(resp.usage.completion_tokens_details, "reasoning_tokens", 0)
+        detail = f"，其中 thinking 用掉 {used}" if used else ""
+        raise RuntimeError(f"輸出被 max_tokens 截斷（目前 {max_tokens}{detail}）")
+
     # 有些 reasoning 模型（實測 qwen3.5 的社群 build）會把 schema 限制過的 JSON
     # 整段吐在 thinking 頻道，content 反而是空的；那份 JSON 本身是對的，直接用。
     if not content and reasoning and schema is not None:
@@ -170,8 +184,6 @@ def ask(
             f"模型把 {used} 個 token 全花在 thinking 上，content 是空的；"
             f"請調高 --max-tokens（目前 {max_tokens}）"
         )
-    if choice.finish_reason == "length":
-        raise RuntimeError(f"輸出被 max_tokens 截斷（目前 {max_tokens}）")
     return content
 
 
@@ -223,7 +235,14 @@ def extract_meta(client, meta_model: str, page1_md: str) -> dict:
     )
     meta = json.loads(raw)
     meta["文別"] = doc_type(page1_md)
+    meta["主旨"] = subject(page1_md) or meta.get("主旨", "")
     return meta
+
+
+def subject(page1_md: str) -> str:
+    """從第 1 頁抓主旨全文；抓不到回空字串，由呼叫端沿用模型抽的值。"""
+    m = SUBJECT_RE.search(page1_md)
+    return " ".join(m.group(1).split()) if m else ""
 
 
 def doc_type(page1_md: str) -> str:
