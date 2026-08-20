@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """公文 PDF -> Markdown（含 YAML frontmatter metadata）
 
-用 PyMuPDF 把掃描 PDF 每頁轉成點陣圖，交給 Claude Vision 做 OCR + 版面重建 +
+用 PyMuPDF 把掃描 PDF 每頁轉成點陣圖，交給 OpenAI 視覺模型做 OCR + 版面重建 +
 metadata 抽取，輸出成 .md 檔（開頭是 YAML frontmatter）。
 
 輸出的正文會逐頁插入 `<!-- page: N/總頁數 -->` 標記，方便後續 RAG
 切 chunk 時保留頁碼來源。
 
 用法:
-    export ANTHROPIC_API_KEY=sk-ant-...
+    export OPENAI_API_KEY=sk-...
     python3 ocr_doc.py                    # input/ 底下所有 pdf -> output/
     python3 ocr_doc.py a.pdf b.pdf        # 只處理指定檔案
     python3 ocr_doc.py -i in/ -o out/     # 指定輸入／輸出目錄
+    python3 ocr_doc.py -m gpt-5-mini      # 換模型
 """
 
 from __future__ import annotations
@@ -21,13 +22,14 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
-import anthropic
+import openai
 import pymupdf
 import yaml
 
-MODEL = "claude-opus-5"
+DEFAULT_MODEL = "gpt-5"
 
 # 輸入 PDF 與輸出 Markdown 各自有固定資料夾，不再散在當前目錄。
 DEFAULT_INDIR = "input"
@@ -58,10 +60,10 @@ def collect_pdfs(pdfs: list[str], indir: str) -> list[Path]:
     return [p for p in paths if p.suffix.lower() == ".pdf" and p.is_file()]
 
 
-# Opus 5 高解析度視覺上限：長邊 2576px。超過會被縮放，等於白花 token。
-MAX_EDGE = 2576
-# A4 在 220 DPI 下約 1819x2573，剛好貼齊 MAX_EDGE，把高解析度額度用滿。
-RENDER_DPI = 220
+# OpenAI 視覺輸入會先把影像縮到 2048x2048 以內，長邊超過就是白花 token。
+MAX_EDGE = 2048
+# A4 在 175 DPI 下約 1447x2047，剛好貼齊 MAX_EDGE，把解析度額度用滿。
+RENDER_DPI = 175
 
 # RAG 切 chunk 時用來還原「這段話出自第幾頁」。用 HTML 註解，
 # 算是 Markdown 的隱形內容，不會污染顯示出來的正文。
@@ -196,44 +198,51 @@ def render_pages(pdf_path: Path) -> list[bytes]:
 def build_content(images: list[bytes]) -> list[dict]:
     content: list[dict] = []
     for i, png in enumerate(images, 1):
-        content.append({"type": "text", "text": f"--- 第 {i} 頁 ---"})
+        content.append({"type": "input_text", "text": f"--- 第 {i} 頁 ---"})
+        b64 = base64.standard_b64encode(png).decode()
         content.append(
             {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.standard_b64encode(png).decode(),
-                },
+                "type": "input_image",
+                # 公文字小，低解析度會直接認不出來，一律用 high。
+                "detail": "high",
+                "image_url": f"data:image/png;base64,{b64}",
             }
         )
-    content.append({"type": "text", "text": USER_PROMPT})
+    content.append({"type": "input_text", "text": USER_PROMPT})
     return content
 
 
-def extract(client: anthropic.Anthropic, images: list[bytes]) -> dict:
-    """呼叫 Claude 做 OCR + 抽 metadata，回傳 {'metadata': ..., 'markdown': ...}。"""
+def extract(client: openai.OpenAI, model: str, images: list[bytes]) -> dict:
+    """呼叫模型做 OCR + 抽 metadata，回傳 {'metadata': ..., 'pages': [...]}。"""
     # 影像多、輸出長，一律 streaming 避免 HTTP timeout。
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=32000,
-        system=SYSTEM_PROMPT,
-        thinking={"type": "adaptive"},
-        output_config={
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": SCHEMA},
+    with client.responses.stream(
+        model=model,
+        max_output_tokens=32000,
+        instructions=SYSTEM_PROMPT,
+        reasoning={"effort": "high"},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "official_doc",
+                "schema": SCHEMA,
+                "strict": True,
+            }
         },
-        messages=[{"role": "user", "content": build_content(images)}],
+        input=[{"role": "user", "content": build_content(images)}],
     ) as stream:
-        message = stream.get_final_message()
+        response = stream.get_final_response()
 
-    if message.stop_reason == "refusal":
-        raise RuntimeError(f"模型拒絕處理：{message.stop_details}")
-    if message.stop_reason == "max_tokens":
-        raise RuntimeError("輸出被 max_tokens 截斷，請調高 max_tokens 或分批處理頁面")
+    for item in response.output:
+        for part in getattr(item, "content", None) or []:
+            if part.type == "refusal":
+                raise RuntimeError(f"模型拒絕處理：{part.refusal}")
+    if response.status == "incomplete":
+        reason = getattr(response.incomplete_details, "reason", None) or response.status
+        if reason == "max_output_tokens":
+            raise RuntimeError("輸出被 max_output_tokens 截斷，請調高上限或分批處理頁面")
+        raise RuntimeError(f"回應不完整：{reason}")
 
-    text = next(b.text for b in message.content if b.type == "text")
-    return json.loads(text)
+    return json.loads(response.output_text)
 
 
 def join_pages(pages: list[dict], total: int) -> str:
@@ -268,7 +277,7 @@ def to_markdown_file(result: dict, source: Path, pages: int) -> str:
     return f"---\n{front}---\n\n{body}\n"
 
 
-def process(client: anthropic.Anthropic, pdf: Path, outdir: Path) -> Path:
+def process(client: openai.OpenAI, model: str, pdf: Path, outdir: Path) -> Path:
     images = render_pages(pdf)
     if len(images) > MAX_PAGES_PER_REQUEST:
         raise RuntimeError(
@@ -276,7 +285,7 @@ def process(client: anthropic.Anthropic, pdf: Path, outdir: Path) -> Path:
         )
     print(f"  已 render {len(images)} 頁，送出辨識…", flush=True)
 
-    result = extract(client, images)
+    result = extract(client, model, images)
     got = len(result["pages"])
     if got != len(images):
         # 頁碼標記是給 RAG 溯源用的，對不上就等於引用錯頁，寧可讓它爆掉。
@@ -294,6 +303,8 @@ def main() -> int:
                     help=f"輸入目錄（預設：{DEFAULT_INDIR}/）")
     ap.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR,
                     help=f"輸出目錄（預設：{DEFAULT_OUTDIR}/）")
+    ap.add_argument("-m", "--model", default=None,
+                    help=f"OpenAI 模型（預設：$OPENAI_MODEL 或 {DEFAULT_MODEL}）")
     args = ap.parse_args()
 
     paths = collect_pdfs(args.pdfs, args.indir)
@@ -305,19 +316,27 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     load_dotenv()
-    client = anthropic.Anthropic()
+    model = args.model or os.environ.get("OPENAI_MODEL") or DEFAULT_MODEL
+    # 多頁高解析度影像 + high effort 推理，單份跑好幾分鐘是常態，
+    # SDK 預設的 timeout 不夠用。
+    client = openai.OpenAI(timeout=1800.0)
 
     failed = 0
+    total_secs = 0.0
     for pdf in paths:
         print(f"處理 {pdf.name}")
+        t0 = time.time()
         try:
-            out = process(client, pdf, outdir)
-            print(f"  -> {out}")
+            out = process(client, model, pdf, outdir)
+            secs = time.time() - t0
+            total_secs += secs
+            print(f"  -> {out}（{secs:.1f} 秒）")
         except Exception as e:
             failed += 1
+            total_secs += time.time() - t0
             print(f"  失敗：{e}", file=sys.stderr)
 
-    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份")
+    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份，共 {total_secs:.1f} 秒")
     return 1 if failed else 0
 
 
