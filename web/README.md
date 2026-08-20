@@ -3,9 +3,12 @@
 `../ocr_doc.py` 的 JavaScript 版，包成一個單頁網站：把 PDF 拖進瀏覽器，
 看著進度跑完，下載 `.md`。
 
-辨識邏輯與 Python 版完全一致（同樣的 prompt、同樣的 18 欄 metadata schema、
-同樣的頁碼標記、同樣的 20 頁上限與頁數檢查），兩邊產出的 `.md` 可以互換。
-差別只在入口：CLI 掃資料夾批次跑，這裡一次一份、結果直接下載，不寫進 `output/`。
+辨識邏輯與 Python 版的 OpenAI 路徑完全一致（同樣的 prompt、同樣的 18 欄
+metadata schema、同樣的頁碼標記、同樣的 20 頁上限與頁數檢查），兩邊產出的
+`.md` 可以互換。差別只在入口：CLI 掃資料夾批次跑，這裡一次一份、結果直接下載，
+不寫進 `output/`。
+
+`ocr_doc.py` 另外支援 `-p claude`，這裡沒有——這個服務只接 OpenAI。
 
 ## 安裝
 

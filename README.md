@@ -7,14 +7,15 @@
 
 | | `ocr_doc.py`（雲端） | `ocr_doc_local.py`（地端） |
 | --- | --- | --- |
-| 模型 | Claude Opus 5（Anthropic API） | LM Studio 上的視覺模型 |
+| 模型 | OpenAI GPT-5 或 Claude Opus 5，用 `-p` 選 | LM Studio 上的視覺模型 |
 | 文件外傳 | 會 | 不會 |
 | 送件方式 | 整份文件一次送出，可跨頁理解 | 逐頁辨識再串接（小模型 context 有限）|
 | metadata | 18 個欄位，與正文同一次結構化輸出 | 8 個欄位，先 OCR 第 1 頁再用文字模型抽（文別另用 regex 從首行抓）|
 | 輸出檔名 | `<檔名>.md` | `<檔名>.local.md` |
 
 另有 [`web/`](web/)：雲端版的 JavaScript 移植，包成網頁服務（拖 PDF 進瀏覽器、
-看進度、下載 `.md`）。辨識邏輯與 `ocr_doc.py` 一致，輸出格式相同。
+看進度、下載 `.md`）。辨識邏輯與 `ocr_doc.py` 的 OpenAI 路徑一致，輸出格式相同；
+目前只接 OpenAI，沒有 `-p claude` 的對應選項。
 
 ## 安裝
 
@@ -30,10 +31,13 @@ pip install anthropic openai pymupdf pyyaml opencc-python-reimplemented
 所以走 `.env` 比較可靠；已存在的環境變數優先。
 
 ```
+OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 LM_STUDIO_BASE_URL=http://172.17.224.1:1234/v1
 LM_STUDIO_META_MODEL=...
 ```
+
+雲端版只會用到你要跑的那家的金鑰（SDK 是延後 import 的，另一家沒裝也不影響）。
 
 ## 資料夾
 
@@ -53,7 +57,24 @@ bench_out/  各模型的原始輸出（評測用）
 python3 ocr_doc.py                       # input/ 全部 pdf -> output/
 python3 ocr_doc.py input/a.pdf           # 只處理指定檔案
 python3 ocr_doc.py -i in/ -o out/
+python3 ocr_doc.py -p claude             # 改用 Claude（預設 openai）
+python3 ocr_doc.py -m gpt-5-mini         # 換模型
 ```
+
+OpenAI 與 Claude 兩家並存，`-p` / `--provider` 選一家。prompt、metadata schema、
+輸出格式完全相同，差別只有 SDK、預設模型與影像解析度上限：
+
+| | `-p openai`（預設） | `-p claude` |
+| --- | --- | --- |
+| 金鑰 | `OPENAI_API_KEY` | `ANTHROPIC_API_KEY` |
+| 預設模型 | `gpt-5` | `claude-opus-5` |
+| 覆寫模型的環境變數 | `OPENAI_MODEL` | `ANTHROPIC_MODEL` |
+| render | 175 DPI，長邊 ≤ 2048 | 220 DPI，長邊 ≤ 2576 |
+
+解析度差異是各家視覺輸入上限不同，兩邊都是「把額度用滿又不會被降採樣」的值。
+模型名稱優先序：`-m` > 環境變數 > 內建預設值。
+
+兩家的輸出檔名都是 `<檔名>.md`，要並排比較就用 `-o` 分開放。
 
 單份上限 20 頁（`MAX_PAGES_PER_REQUEST`）。模型回傳的頁數與輸入頁數不符會直接失敗，
 不會產出頁碼對不上的檔案。

@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """公文 PDF -> Markdown（含 YAML frontmatter metadata）
 
-用 PyMuPDF 把掃描 PDF 每頁轉成點陣圖，交給 OpenAI 視覺模型做 OCR + 版面重建 +
+用 PyMuPDF 把掃描 PDF 每頁轉成點陣圖，交給視覺模型做 OCR + 版面重建 +
 metadata 抽取，輸出成 .md 檔（開頭是 YAML frontmatter）。
+
+支援兩家雲端模型，用 `--provider` 選；prompt、schema、輸出格式完全一樣，
+差別只在 SDK、預設模型與影像解析度上限（見 PROVIDERS）。
 
 輸出的正文會逐頁插入 `<!-- page: N/總頁數 -->` 標記，方便後續 RAG
 切 chunk 時保留頁碼來源。
 
 用法:
-    export OPENAI_API_KEY=sk-...
+    export OPENAI_API_KEY=sk-...          # 或 ANTHROPIC_API_KEY，或寫進 .env
     python3 ocr_doc.py                    # input/ 底下所有 pdf -> output/
     python3 ocr_doc.py a.pdf b.pdf        # 只處理指定檔案
     python3 ocr_doc.py -i in/ -o out/     # 指定輸入／輸出目錄
+    python3 ocr_doc.py -p claude          # 改用 Claude（預設 openai）
     python3 ocr_doc.py -m gpt-5-mini      # 換模型
 """
 
@@ -23,17 +27,18 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
-import openai
 import pymupdf
 import yaml
-
-DEFAULT_MODEL = "gpt-5"
 
 # 輸入 PDF 與輸出 Markdown 各自有固定資料夾，不再散在當前目錄。
 DEFAULT_INDIR = "input"
 DEFAULT_OUTDIR = "output"
+
+DEFAULT_PROVIDER = "openai"
 
 
 def load_dotenv() -> None:
@@ -59,11 +64,6 @@ def collect_pdfs(pdfs: list[str], indir: str) -> list[Path]:
     paths = [Path(p) for p in pdfs] if pdfs else sorted(Path(indir).glob("*.pdf"))
     return [p for p in paths if p.suffix.lower() == ".pdf" and p.is_file()]
 
-
-# OpenAI 視覺輸入會先把影像縮到 2048x2048 以內，長邊超過就是白花 token。
-MAX_EDGE = 2048
-# A4 在 175 DPI 下約 1447x2047，剛好貼齊 MAX_EDGE，把解析度額度用滿。
-RENDER_DPI = 175
 
 # RAG 切 chunk 時用來還原「這段話出自第幾頁」。用 HTML 註解，
 # 算是 Markdown 的隱形內容，不會污染顯示出來的正文。
@@ -182,20 +182,30 @@ SCHEMA = {
 }
 
 
-def render_pages(pdf_path: Path) -> list[bytes]:
-    """把 PDF 每頁 render 成 PNG bytes，長邊不超過 MAX_EDGE。"""
+def render_pages(pdf_path: Path, dpi: int, max_edge: int) -> list[bytes]:
+    """把 PDF 每頁 render 成 PNG bytes，長邊不超過 max_edge。"""
     images = []
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
-            pix = page.get_pixmap(dpi=RENDER_DPI)
-            if max(pix.width, pix.height) > MAX_EDGE:
-                scale = MAX_EDGE / max(pix.width, pix.height)
-                pix = page.get_pixmap(dpi=int(RENDER_DPI * scale))
+            pix = page.get_pixmap(dpi=dpi)
+            if max(pix.width, pix.height) > max_edge:
+                scale = max_edge / max(pix.width, pix.height)
+                pix = page.get_pixmap(dpi=int(dpi * scale))
             images.append(pix.tobytes("png"))
     return images
 
 
-def build_content(images: list[bytes]) -> list[dict]:
+# --- OpenAI ------------------------------------------------------------------
+
+def make_client_openai() -> Any:
+    import openai
+
+    # 多頁高解析度影像 + high effort 推理，單份跑好幾分鐘是常態，
+    # SDK 預設的 timeout 不夠用。
+    return openai.OpenAI(timeout=1800.0)
+
+
+def build_content_openai(images: list[bytes]) -> list[dict]:
     content: list[dict] = []
     for i, png in enumerate(images, 1):
         content.append({"type": "input_text", "text": f"--- 第 {i} 頁 ---"})
@@ -212,8 +222,8 @@ def build_content(images: list[bytes]) -> list[dict]:
     return content
 
 
-def extract(client: openai.OpenAI, model: str, images: list[bytes]) -> dict:
-    """呼叫模型做 OCR + 抽 metadata，回傳 {'metadata': ..., 'pages': [...]}。"""
+def extract_openai(client: Any, model: str, images: list[bytes]) -> dict:
+    """呼叫 OpenAI 做 OCR + 抽 metadata，回傳 {'metadata': ..., 'pages': [...]}。"""
     # 影像多、輸出長，一律 streaming 避免 HTTP timeout。
     with client.responses.stream(
         model=model,
@@ -228,7 +238,7 @@ def extract(client: openai.OpenAI, model: str, images: list[bytes]) -> dict:
                 "strict": True,
             }
         },
-        input=[{"role": "user", "content": build_content(images)}],
+        input=[{"role": "user", "content": build_content_openai(images)}],
     ) as stream:
         response = stream.get_final_response()
 
@@ -243,6 +253,98 @@ def extract(client: openai.OpenAI, model: str, images: list[bytes]) -> dict:
         raise RuntimeError(f"回應不完整：{reason}")
 
     return json.loads(response.output_text)
+
+
+# --- Claude ------------------------------------------------------------------
+
+def make_client_claude() -> Any:
+    import anthropic
+
+    return anthropic.Anthropic()
+
+
+def build_content_claude(images: list[bytes]) -> list[dict]:
+    content: list[dict] = []
+    for i, png in enumerate(images, 1):
+        content.append({"type": "text", "text": f"--- 第 {i} 頁 ---"})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.standard_b64encode(png).decode(),
+                },
+            }
+        )
+    content.append({"type": "text", "text": USER_PROMPT})
+    return content
+
+
+def extract_claude(client: Any, model: str, images: list[bytes]) -> dict:
+    """呼叫 Claude 做 OCR + 抽 metadata，回傳 {'metadata': ..., 'pages': [...]}。"""
+    # 影像多、輸出長，一律 streaming 避免 HTTP timeout。
+    with client.messages.stream(
+        model=model,
+        max_tokens=32000,
+        system=SYSTEM_PROMPT,
+        thinking={"type": "adaptive"},
+        output_config={
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": SCHEMA},
+        },
+        messages=[{"role": "user", "content": build_content_claude(images)}],
+    ) as stream:
+        message = stream.get_final_message()
+
+    if message.stop_reason == "refusal":
+        raise RuntimeError(f"模型拒絕處理：{message.stop_details}")
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError("輸出被 max_tokens 截斷，請調高 max_tokens 或分批處理頁面")
+
+    text = next(b.text for b in message.content if b.type == "text")
+    return json.loads(text)
+
+
+@dataclass(frozen=True)
+class Provider:
+    """一家雲端模型的接法。兩家的 prompt、schema、輸出格式都相同，
+    差別只有這裡列的幾項。"""
+
+    name: str
+    default_model: str
+    model_env: str
+    # 視覺輸入的解析度上限：超過會被 API 自己縮，等於白花 token。
+    max_edge: int
+    render_dpi: int
+    make_client: Callable[[], Any]
+    extract: Callable[[Any, str, list[bytes]], dict]
+
+
+PROVIDERS = {
+    "openai": Provider(
+        name="openai",
+        default_model="gpt-5",
+        model_env="OPENAI_MODEL",
+        # OpenAI 視覺輸入會先把影像縮到 2048x2048 以內。
+        max_edge=2048,
+        # A4 在 175 DPI 下約 1447x2047，剛好貼齊 max_edge，把解析度額度用滿。
+        render_dpi=175,
+        make_client=make_client_openai,
+        extract=extract_openai,
+    ),
+    "claude": Provider(
+        name="claude",
+        default_model="claude-opus-5",
+        model_env="ANTHROPIC_MODEL",
+        # Opus 5 高解析度視覺上限：長邊 2576px。
+        max_edge=2576,
+        # A4 在 220 DPI 下約 1819x2573，剛好貼齊 max_edge。
+        render_dpi=220,
+        make_client=make_client_claude,
+        extract=extract_claude,
+    ),
+}
 
 
 def join_pages(pages: list[dict], total: int) -> str:
@@ -277,15 +379,15 @@ def to_markdown_file(result: dict, source: Path, pages: int) -> str:
     return f"---\n{front}---\n\n{body}\n"
 
 
-def process(client: openai.OpenAI, model: str, pdf: Path, outdir: Path) -> Path:
-    images = render_pages(pdf)
+def process(provider: Provider, client: Any, model: str, pdf: Path, outdir: Path) -> Path:
+    images = render_pages(pdf, provider.render_dpi, provider.max_edge)
     if len(images) > MAX_PAGES_PER_REQUEST:
         raise RuntimeError(
             f"{pdf.name} 有 {len(images)} 頁，超過單次上限 {MAX_PAGES_PER_REQUEST}"
         )
     print(f"  已 render {len(images)} 頁，送出辨識…", flush=True)
 
-    result = extract(client, model, images)
+    result = provider.extract(client, model, images)
     got = len(result["pages"])
     if got != len(images):
         # 頁碼標記是給 RAG 溯源用的，對不上就等於引用錯頁，寧可讓它爆掉。
@@ -303,8 +405,10 @@ def main() -> int:
                     help=f"輸入目錄（預設：{DEFAULT_INDIR}/）")
     ap.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR,
                     help=f"輸出目錄（預設：{DEFAULT_OUTDIR}/）")
+    ap.add_argument("-p", "--provider", choices=sorted(PROVIDERS), default=DEFAULT_PROVIDER,
+                    help=f"用哪家模型（預設：{DEFAULT_PROVIDER}）")
     ap.add_argument("-m", "--model", default=None,
-                    help=f"OpenAI 模型（預設：$OPENAI_MODEL 或 {DEFAULT_MODEL}）")
+                    help="模型名稱（預設：各 provider 的 $..._MODEL 或內建預設值）")
     args = ap.parse_args()
 
     paths = collect_pdfs(args.pdfs, args.indir)
@@ -316,10 +420,10 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     load_dotenv()
-    model = args.model or os.environ.get("OPENAI_MODEL") or DEFAULT_MODEL
-    # 多頁高解析度影像 + high effort 推理，單份跑好幾分鐘是常態，
-    # SDK 預設的 timeout 不夠用。
-    client = openai.OpenAI(timeout=1800.0)
+    provider = PROVIDERS[args.provider]
+    model = args.model or os.environ.get(provider.model_env) or provider.default_model
+    client = provider.make_client()
+    print(f"provider={provider.name} model={model}")
 
     failed = 0
     total_secs = 0.0
@@ -327,7 +431,7 @@ def main() -> int:
         print(f"處理 {pdf.name}")
         t0 = time.time()
         try:
-            out = process(client, model, pdf, outdir)
+            out = process(provider, client, model, pdf, outdir)
             secs = time.time() - t0
             total_secs += secs
             print(f"  -> {out}（{secs:.1f} 秒）")
