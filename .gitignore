@@ -5,3 +5,5 @@ bench_out/
 input/
 output/
 .claude
+.gstack/
+node_modules/
