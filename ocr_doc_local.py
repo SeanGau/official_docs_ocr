@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import openai
@@ -346,19 +347,26 @@ def main() -> int:
 
     # 先把所有文件 OCR 完，再統一抽 metadata。兩個模型交錯呼叫會讓 LM Studio
     # 一直換載入，實測會把模型跑到 crash。
-    done: list[tuple[Path, list[str]]] = []
+    # 每份文件的時間分兩段累計（OCR、metadata），最後一起報。
+    done: list[tuple[Path, list[str], float]] = []
     failed = 0
     for pdf in paths:
         print(f"處理 {pdf.name}")
+        t0 = time.time()
         try:
-            done.append((pdf, ocr_pdf(client, model, pdf, args.dpi, args.max_edge,
-                                      args.max_tokens)))
+            parts = ocr_pdf(client, model, pdf, args.dpi, args.max_edge,
+                            args.max_tokens)
+            secs = time.time() - t0
+            done.append((pdf, parts, secs))
+            print(f"  OCR {secs:.1f} 秒（{secs / max(len(parts), 1):.1f} 秒/頁）")
         except Exception as e:
             failed += 1
-            print(f"  失敗：{e}", file=sys.stderr)
+            print(f"  失敗：{e}（{time.time() - t0:.1f} 秒）", file=sys.stderr)
 
-    for pdf, parts in done:
+    total_secs = 0.0
+    for pdf, parts, ocr_secs in done:
         meta = {}
+        t0 = time.time()
         if meta_model and parts:
             print(f"抽 metadata {pdf.name}（{meta_model}）…", flush=True)
             try:
@@ -366,9 +374,13 @@ def main() -> int:
             except (json.JSONDecodeError, openai.APIError, RuntimeError) as e:
                 # 抽不到 metadata 不該讓已經辨識好的內文一起白費。
                 print(f"  metadata 抽取失敗（{e}），改為只輸出內文", file=sys.stderr)
-        print(f"  -> {write_doc(pdf, outdir, parts, meta)}")
+        meta_secs = time.time() - t0
+        total_secs += ocr_secs + meta_secs
+        print(f"  -> {write_doc(pdf, outdir, parts, meta)}"
+              f"（共 {ocr_secs + meta_secs:.1f} 秒＝OCR {ocr_secs:.1f}"
+              f" + metadata {meta_secs:.1f}）")
 
-    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份")
+    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份，共 {total_secs:.1f} 秒")
     return 1 if failed else 0
 
 

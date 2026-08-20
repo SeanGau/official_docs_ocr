@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import anthropic
@@ -308,16 +309,21 @@ def main() -> int:
     client = anthropic.Anthropic()
 
     failed = 0
+    total_secs = 0.0
     for pdf in paths:
         print(f"處理 {pdf.name}")
+        t0 = time.time()
         try:
             out = process(client, pdf, outdir)
-            print(f"  -> {out}")
+            secs = time.time() - t0
+            total_secs += secs
+            print(f"  -> {out}（{secs:.1f} 秒）")
         except Exception as e:
             failed += 1
+            total_secs += time.time() - t0
             print(f"  失敗：{e}", file=sys.stderr)
 
-    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份")
+    print(f"\n完成 {len(paths) - failed}/{len(paths)} 份，共 {total_secs:.1f} 秒")
     return 1 if failed else 0
 
 
