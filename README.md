@@ -7,10 +7,10 @@
 
 | | `ocr_doc.py`（雲端） | `ocr_doc_local.py`（地端） |
 | --- | --- | --- |
-| 模型 | OpenAI GPT-5 或 Claude Opus 5，用 `-p` 選 | LM Studio 上的視覺模型 |
+| 模型 | OpenAI GPT-5 或 Claude Opus 5，用 `-p` 選 | NVIDIA Nemotron-Parse 2.0（固定） |
 | 文件外傳 | 會 | 不會 |
-| 送件方式 | 整份文件一次送出，可跨頁理解 | 逐頁辨識再串接（小模型 context 有限）|
-| metadata | 18 個欄位，與正文同一次結構化輸出 | 8 個欄位，先 OCR 第 1 頁再用文字模型抽（文別另用 regex 從首行抓）|
+| 送件方式 | 整份文件一次送出，可跨頁理解 | 逐頁辨識再串接 |
+| metadata | 18 個欄位，與正文同一次結構化輸出 | 從第 1 頁 OCR 文字的固定標籤抽取 |
 | 輸出檔名 | `<檔名>.md` | `<檔名>.local.md` |
 
 另有 [`web/`](web/)：雲端版的 JavaScript 移植，包成網頁服務（拖 PDF 進瀏覽器、
@@ -19,13 +19,15 @@
 
 ## 安裝
 
-Python 3.10+，套件：
+Python 3.10+，使用 [uv](https://docs.astral.sh/uv/) 管理相依套件。依要執行的版本安裝：
 
 ```bash
-pip install anthropic openai pymupdf pyyaml opencc-python-reimplemented
+uv sync --extra cloud                  # ocr_doc.py
+uv sync --extra local                  # ocr_doc_local.py
+uv sync --extra local --extra bench    # bench_ocr.py
 ```
 
-（`opencc` 只有 `bench_ocr.py` 用到。）
+下方的 `uv run --extra ...` 也會自動同步需要的環境，不必先手動執行 `uv sync`。
 
 金鑰放專案根目錄的 `.env`，一行一個 `KEY=VALUE`。非互動 shell 讀不到 `~/.bashrc`，
 所以走 `.env` 比較可靠；已存在的環境變數優先。
@@ -33,8 +35,6 @@ pip install anthropic openai pymupdf pyyaml opencc-python-reimplemented
 ```
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
-LM_STUDIO_BASE_URL=http://172.17.224.1:1234/v1
-LM_STUDIO_META_MODEL=...
 ```
 
 雲端版只會用到你要跑的那家的金鑰（SDK 是延後 import 的，另一家沒裝也不影響）。
@@ -54,11 +54,11 @@ bench_out/  各模型的原始輸出（評測用）
 ### 雲端版
 
 ```bash
-python3 ocr_doc.py                       # input/ 全部 pdf -> output/
-python3 ocr_doc.py input/a.pdf           # 只處理指定檔案
-python3 ocr_doc.py -i in/ -o out/
-python3 ocr_doc.py -p claude             # 改用 Claude（預設 openai）
-python3 ocr_doc.py -m gpt-5-mini         # 換模型
+uv run --extra cloud ocr_doc.py                       # input/ 全部 pdf -> output/
+uv run --extra cloud ocr_doc.py input/a.pdf           # 只處理指定檔案
+uv run --extra cloud ocr_doc.py -i in/ -o out/
+uv run --extra cloud ocr_doc.py -p claude             # 改用 Claude（預設 openai）
+uv run --extra cloud ocr_doc.py -m gpt-5-mini         # 換模型
 ```
 
 OpenAI 與 Claude 兩家並存，`-p` / `--provider` 選一家。prompt、metadata schema、
@@ -81,22 +81,29 @@ OpenAI 與 Claude 兩家並存，`-p` / `--provider` 選一家。prompt、metada
 
 ### 地端版
 
-先在 LM Studio 載入一個 vision 模型並啟動 server：
+地端版固定使用 [`nvidia/NVIDIA-Nemotron-Parse-2.0`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-2.0)。
+其官方架構是 C-RADIO ViT-H vision encoder 加 mBART decoder，不含 Qwen base；
+程式也不提供切換 OCR 模型或第二個 metadata 模型的路徑。
+
+地端版直接在目前的 Python process 載入 Hugging Face Transformers，不需要 vLLM、
+OpenAI 相容服務、API key 或另一個 terminal：
 
 ```bash
-python3 ocr_doc_local.py
-python3 ocr_doc_local.py --base-url http://172.17.224.1:1234/v1
-python3 ocr_doc_local.py --model qwen2.5-vl-7b-instruct --dpi 180
-python3 ocr_doc_local.py --model "allenai/olmocr-2-7b" --meta-model "gemma-4-e4b-it"
-python3 ocr_doc_local.py --no-meta                 # 只要內文
+uv run --extra local ocr_doc_local.py
+uv run --extra local ocr_doc_local.py input/a.pdf
+uv run --extra local ocr_doc_local.py --model /path/to/NVIDIA-Nemotron-Parse-2.0
+uv run --extra local ocr_doc_local.py --local-files-only
+uv run --extra local ocr_doc_local.py --no-meta
 ```
 
-WSL 連 Windows 上的 LM Studio 要走 gateway IP，不是 `127.0.0.1`。
+第一次執行會從 Hugging Face 下載模型，之後使用本機 cache。預設 `--device auto` 會優先
+使用 `cuda:0`；沒有 CUDA 時會退回 CPU（可明確指定 `--device cpu`，但會慢很多）。
+`--model` 可接受 Hugging Face model ID 或本機模型目錄；搭配 `--local-files-only` 可保證
+執行時不連網。
 
-olmOCR 這類 OCR 專用模型不會 instruction following，直接叫它吐 JSON 一定失敗，
-所以 metadata 分兩段抽：先 OCR 出文字，再把文字交給 `--meta-model` 的文字模型。
-所有文件會先全部 OCR 完才統一抽 metadata——兩個模型交錯呼叫會讓 LM Studio
-一直換載入，實測會跑到 crash。
+模型輸入使用官方建議的 `1664×2048` 上限與控制 token；Transformers 產生的 bbox/class
+包裝會在寫檔前移除，只保留 reading order 中的 Markdown。metadata 不再呼叫語言模型，
+而是從首頁的「受文者」、「發文日期」、「發文字號」等固定標籤確定性抽取。
 
 ## 輸出格式
 
@@ -138,15 +145,14 @@ olmOCR 這類 OCR 專用模型不會 instruction following，直接叫它吐 JSO
 
 ## 評測地端模型
 
-拿多個地端模型跑同一批 PDF，跟 `output/` 裡雲端版的產出逐項比對：
+用同一批 PDF 跑 Nemotron-Parse 2.0，跟 `output/` 裡雲端版的產出逐項比對：
 
 ```bash
-python3 bench_ocr.py --base-url http://172.17.224.1:1234/v1 \
-    --models model-a model-b
+uv run --extra local --extra bench bench_ocr.py
 ```
 
 指標：相似度、關鍵欄位（發文字號／發文日期／主旨）逐字命中、簡體字洩漏率、
-重複迴圈佔比、篇幅比、秒/頁、支不支援 json_schema。各模型的完整輸出留在 `bench_out/`。
+重複迴圈佔比、篇幅比與秒/頁。完整輸出留在 `bench_out/`。
 
 雲端版的產出只是**參照**不是 ground truth，它本身也可能有錯；相似度低不必然代表
 地端模型錯，但差距很大時通常是。

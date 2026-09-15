@@ -1,212 +1,255 @@
 #!/usr/bin/env python3
-"""公文 PDF -> Markdown（地端版，走 LM Studio 的 OpenAI 相容 API）
+"""公文 PDF -> Markdown（地端版，直接使用 Hugging Face Transformers）
 
-與 ocr_doc.py 的差別：
-  * 模型跑在本機（LM Studio），不需要 API 金鑰、不外傳文件。
-  * 8GB 級距的視覺模型 context 有限，所以「逐頁」辨識再串起來，
-    不像雲端版一次把整份文件送出。
-  * metadata 分兩段抽：先讓 OCR 模型把第 1 頁轉成文字，再把「文字」交給
-    文字模型抽欄位。olmocr 這類 OCR 專用模型不會 instruction following，
-    直接叫它吐 JSON 一定失敗；而純文字階段不必看影像，小模型也做得準。
+地端版固定使用 NVIDIA Nemotron-Parse 2.0，不接受其他 OCR 模型：
+  * 官方模型架構是 C-RADIO ViT-H vision encoder + mBART decoder，不含 Qwen base。
+  * 逐頁辨識後串接，並保留與雲端版相同的頁碼標記。
+  * metadata 直接從 OCR 文字的固定欄位抽取，不再載入第二個語言模型。
 
-輸出的正文會逐頁插入 `<!-- page: N/總頁數 -->` 標記（與雲端版同格式），
-方便後續 RAG 切 chunk 時保留頁碼來源。
-
-用法:
-    # LM Studio 先載入一個 vision 模型並啟動 server
-    python3 ocr_doc_local.py                    # input/ 底下所有 pdf -> output/
-    python3 ocr_doc_local.py a.pdf -o out/
-    python3 ocr_doc_local.py --base-url http://172.17.224.1:1234/v1
-    python3 ocr_doc_local.py --model qwen2.5-vl-7b-instruct --dpi 180
-    python3 ocr_doc_local.py --meta-model qwen3.5-9b      # 指定抽 metadata 的文字模型
-    python3 ocr_doc_local.py --no-meta                    # 只要內文，不抽 metadata
+模型會由 Hugging Face 首次下載並留在 cache，不需要另外啟動服務：
+    uv run --extra local ocr_doc_local.py
+    uv run --extra local ocr_doc_local.py a.pdf -o out/
+    uv run --extra local ocr_doc_local.py --model /path/to/model
+    uv run --extra local ocr_doc_local.py --no-meta
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import json
-import os
+import logging
 import re
 import sys
 import time
+import warnings
+from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 
-import openai
 import pymupdf
+import torch
 import yaml
+from PIL import Image
+from transformers import AutoModel, AutoProcessor, AutoTokenizer, GenerationConfig
 
-# .env 讀取、輸入蒐集、頁碼標記格式都跟雲端版共用，不另外複製一份。
-from ocr_doc import DEFAULT_INDIR, DEFAULT_OUTDIR, PAGE_MARKER, collect_pdfs, load_dotenv
+from ocr_doc import DEFAULT_INDIR, DEFAULT_OUTDIR, PAGE_MARKER, collect_pdfs
 
-# WSL 連 Windows 上的 LM Studio 要走 gateway，不是 127.0.0.1，
-# 所以端點做成可用 .env 的 LM_STUDIO_BASE_URL 覆寫。
-DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+# Hugging Face 模型 ID；--model 也接受已下載的本機目錄。
+DEFAULT_MODEL = "nvidia/NVIDIA-Nemotron-Parse-2.0"
 
-# 地端小模型的影像 token 很貴又容易失焦，解析度抓「字看得清楚」就好，
-# 不像雲端版把高解析度額度用滿。150 DPI 的 A4 約 1240x1754。
+# 官方建議輸入範圍為 1024x1280 至 1664x2048；保留長寬比並限制上界。
 RENDER_DPI = 150
-MAX_EDGE = 1600
+MAX_WIDTH = 1664
+MAX_HEIGHT = 2048
 
-SYSTEM_PROMPT = """\
-你是台灣公文數位化專家，負責把掃描的公文影像轉成 Markdown。
+# 官方建議 prompt：輸出 bbox、語意類別與 Markdown，不辨識圖片區塊內文字。
+NEMOTRON_PROMPT = (
+    "</s><s><predict_bbox><predict_classes>"
+    "<output_markdown><predict_no_text_in_pic>"
+)
 
-要求：
-1. 逐字精確 OCR，輸出繁體中文。機關名稱、人名、地名務必正確。
-2. 保留公文層次：主旨、說明（一、二、三…）、辦法等，
-   子項 (一)(二)、1.2.3. 用 Markdown 巢狀清單表示。
-3. 表格用 Markdown 表格重建。
-4. 印章、簽名、浮水印用 `<!-- 印章：OO部 -->` 這類 HTML 註解標註，不要當正文。
-   手寫批註同樣用註解並註明「手寫」。
-5. 完全無法辨識的字用 `〇`，不要臆測。
-6. 民國紀年保留原文，不要換算。
-7. 只輸出公文內容，不要加任何說明、前言或程式碼圍籬。
-"""
-
-PAGE_PROMPT = "這是公文的第 {n} 頁（共 {total} 頁）。請把這一頁的內容轉成 Markdown。"
-
-META_SYSTEM = """\
-你從台灣公文的 OCR 文字中抽取欄位。
-只根據文字中確實出現的內容填寫，找不到的欄位填空字串，絕不推測或編造。
-"""
-
-META_PROMPT = """\
-以下是公文第 1 頁的 OCR 文字：
-
-{text}
-
-請抽出欄位，以 JSON 回覆。
-"""
-
-# 欄位是從「OCR 出來的文字」抽的，不是看影像猜的，所以可以多抽幾個；
-# 但仍只取公文首頁一定有的項目，避免要模型跨頁推論。
-META_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["發文機關", "受文者", "發文日期", "發文字號", "速別",
-                 "密等及解密條件", "附件", "主旨"],
-    "properties": {
-        "發文機關": {"type": "string", "description": "發文的機關全銜"},
-        "受文者": {"type": "string"},
-        "發文日期": {"type": "string", "description": "原件民國紀年，如「中華民國110年8月31日」"},
-        "發文字號": {"type": "string", "description": "如「開字第1100831001號」"},
-        "速別": {"type": "string", "description": "普通件／速件／最速件"},
-        "密等及解密條件": {"type": "string"},
-        "附件": {"type": "array", "items": {"type": "string"}},
-        "主旨": {"type": "string", "description": "主旨欄全文，不含「主旨：」三字"},
-    },
-}
+# metadata 只從 OCR 文字中位置固定的欄位擷取，不呼叫第二個模型。
+META_FIELDS = (
+    "發文機關",
+    "受文者",
+    "發文日期",
+    "發文字號",
+    "速別",
+    "密等及解密條件",
+    "附件",
+    "主旨",
+)
 
 # 文別不是獨立欄位，而是印在首行機關全銜後面（「○○○　函」）。位置固定，
 # 用 regex 抓；交給 4B 級小模型判斷實測三份全錯（''、「說明」、「N/A」）。
 DOC_TYPES = ("開會通知單", "書函", "公告", "移文單", "報告", "函", "令", "簽")
 
-# 主旨同樣位置固定：「主旨：」起、「說明：」或空行止。實測 gemma-4-e4b-it 會在
-# 後面黏上自評（「(註：原文結尾為…)」），qwen3.5-9b 則有時把整段說明吞進來，
-# 兩個模型都髒過，所以能用 regex 抓就不要問模型。
-SUBJECT_RE = re.compile(r"主旨[：:]\s*(.+?)(?=\n\s*\n|\n?\s*說明[：:]|$)", re.S)
+# 主旨位置固定：「主旨：」起、「說明：」或空行止。
+SUBJECT_RE = re.compile(
+    r"(?:^|\n)\s*(?:[#>*+\-]+\s*)*主旨[：:]\s*"
+    r"(.+?)(?=\n\s*(?:[#>*+\-]+\s*)*說明[：:]|\n\s*\n|$)",
+    re.S,
+)
+NEMOTRON_BLOCK_RE = re.compile(
+    r"<x_(?:\d+(?:\.\d+)?)><y_(?:\d+(?:\.\d+)?)>"
+    r"(.*?)"
+    r"<x_(?:\d+(?:\.\d+)?)><y_(?:\d+(?:\.\d+)?)>"
+    r"<class_([^>]+)>",
+    re.S,
+)
 
 
-def render_pages(pdf_path: Path, dpi: int, max_edge: int) -> list[bytes]:
-    """把 PDF 每頁 render 成 PNG bytes，長邊不超過 max_edge。"""
+def render_pages(
+    pdf_path: Path,
+    dpi: int,
+    max_width: int,
+    max_height: int,
+) -> list[bytes]:
+    """把 PDF 每頁 render 成 PNG bytes，符合 Nemotron 的輸入尺寸上限。"""
     images = []
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
-            pix = page.get_pixmap(dpi=dpi)
-            if max(pix.width, pix.height) > max_edge:
-                scale = max_edge / max(pix.width, pix.height)
-                pix = page.get_pixmap(dpi=int(dpi * scale))
+            scale = min(
+                dpi / 72,
+                max_width / page.rect.width,
+                max_height / page.rect.height,
+            )
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             images.append(pix.tobytes("png"))
     return images
 
 
-def image_part(png: bytes) -> dict:
-    b64 = base64.standard_b64encode(png).decode()
-    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+PAGE_MAX_TOKENS = 8192
 
 
-# 欄位雖然短，但 meta model 多半是 reasoning 模型，額度要含 thinking 的量。
-# 實測 gemma-4-e4b-it 約 800、qwen3.5-9b 要到 6000 才把 8 個欄位抽完；
-# 給太少不會報「答錯」，而是 content 空掉、metadata 整份抽不到。
-META_MAX_TOKENS = 8192
-PAGE_MAX_TOKENS = 4096
+class _MessageFilter(logging.Filter):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return self.text not in record.getMessage()
 
 
-def ask(
-    client,
-    model: str,
-    png: bytes | None,
-    prompt: str,
-    schema: dict | None = None,
-    max_tokens: int = PAGE_MAX_TOKENS,
-    system: str = SYSTEM_PROMPT,
-) -> str:
-    kwargs = {}
-    if schema is not None:
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "metadata", "strict": True, "schema": schema},
+@contextmanager
+def _quiet_nemotron_startup():
+    """只隱藏固定上游版本在載入 Nemotron 時產生的已知無害訊息。"""
+    logger_filters = [
+        (
+            logging.getLogger("huggingface_hub.utils._http"),
+            _MessageFilter("You are sending unauthenticated requests to the HF Hub"),
+        ),
+        (
+            logging.getLogger("timm.models._builder"),
+            _MessageFilter("No pretrained configuration specified for"),
+        ),
+        (
+            logging.getLogger("transformers.configuration_utils"),
+            _MessageFilter("`torch_dtype` is deprecated!"),
+        ),
+    ]
+    for logger, message_filter in logger_filters:
+        logger.addFilter(message_filter)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`torch\.jit\.interface` is deprecated\..*",
+                category=FutureWarning,
+                module=r"torch\.jit\._script",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Importing from timm\.models\.registry is deprecated.*",
+                category=FutureWarning,
+                module=r"timm\.models\.registry",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Importing from timm\.models\.layers is deprecated.*",
+                category=FutureWarning,
+                module=r"timm\.models\.layers(?:\.__init__)?",
+            )
+            yield
+    finally:
+        for logger, message_filter in logger_filters:
+            logger.removeFilter(message_filter)
+
+
+class NemotronRuntime:
+    """只載入一次模型，逐頁直接執行 Transformers generation。"""
+
+    def __init__(
+        self,
+        model_path: str = DEFAULT_MODEL,
+        device: str = "auto",
+        local_files_only: bool = False,
+    ) -> None:
+        if device == "auto":
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("找不到可用的 CUDA GPU；可用 --device cpu 強制使用 CPU")
+
+        self.device = torch.device(device)
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        load_args = {
+            "trust_remote_code": True,
+            "local_files_only": local_files_only,
         }
-    content_parts = [{"type": "text", "text": prompt}]
-    if png is not None:
-        content_parts.insert(0, image_part(png))
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=0,  # OCR 不需要創意，壓掉隨機性
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": content_parts},
-        ],
-        **kwargs,
-    )
-    choice = resp.choices[0]
-    content = (choice.message.content or "").strip()
-    reasoning = (getattr(choice.message, "reasoning_content", None) or "").strip()
+        with _quiet_nemotron_startup():
+            self.model = AutoModel.from_pretrained(
+                model_path,
+                dtype=dtype,
+                **load_args,
+            ).to(self.device).eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, **load_args)
+            self.processor = AutoProcessor.from_pretrained(model_path, **load_args)
+            self.generation_config = GenerationConfig.from_pretrained(model_path, **load_args)
 
-    # 截斷要最先判掉。thinking 被切一半時，下面那段 fallback 會把殘缺的 JSON
-    # 當成答案回傳，錯誤最後才在 json.loads 爆成看不懂的 JSONDecodeError。
-    if choice.finish_reason == "length":
-        used = getattr(resp.usage.completion_tokens_details, "reasoning_tokens", 0)
-        detail = f"，其中 thinking 用掉 {used}" if used else ""
-        raise RuntimeError(f"輸出被 max_tokens 截斷（目前 {max_tokens}{detail}）")
+    def parse_page(self, png: bytes, max_tokens: int) -> str:
+        with Image.open(BytesIO(png)) as source:
+            image = source.convert("RGB")
+        inputs = self.processor(
+            images=[image],
+            text=NEMOTRON_PROMPT,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).to(self.device)
 
-    # 有些 reasoning 模型（實測 qwen3.5 的社群 build）會把 schema 限制過的 JSON
-    # 整段吐在 thinking 頻道，content 反而是空的；那份 JSON 本身是對的，直接用。
-    if not content and reasoning and schema is not None:
-        return reasoning
+        generation_config = GenerationConfig.from_dict(self.generation_config.to_dict())
+        generation_config.max_new_tokens = max_tokens
+        generation_config.do_sample = False
+        generation_config.num_beams = 1
+        generation_config.repetition_penalty = 1.1
+        # Nemotron 官方 remote code 仍呼叫 Transformers 5.6.1 的舊 mask helper。
+        # 只在 generation 範圍忽略這一則已知相容性警告，其他警告照常顯示。
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The attention mask API under .* is deprecated .*",
+                category=FutureWarning,
+                module=r"transformers\.modeling_attn_mask_utils",
+            )
+            with torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    generation_config=generation_config,
+                )
 
-    # 非 structured 的情況下 content 空掉，多半是 token 全花在 thinking 上，
-    # 靜默回空字串會很難查，直接報出來。
-    if not content and reasoning:
-        used = getattr(resp.usage.completion_tokens_details, "reasoning_tokens", "?")
-        raise RuntimeError(
-            f"模型把 {used} 個 token 全花在 thinking 上，content 是空的；"
-            f"請調高 --max-tokens（目前 {max_tokens}）"
+        eos_ids = generation_config.eos_token_id
+        eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or ())
+        if output_ids.shape[-1] >= max_tokens and output_ids[0, -1].item() not in eos_ids:
+            raise RuntimeError(f"輸出被 max_tokens 截斷（目前 {max_tokens}）")
+        content = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        if not content:
+            raise RuntimeError("Nemotron-Parse 2.0 回傳空內容")
+        return nemotron_to_markdown(content)
+
+
+def parse_page(runtime: NemotronRuntime, png: bytes, max_tokens: int = PAGE_MAX_TOKENS) -> str:
+    """以 Direct Transformers 解析單頁，回傳乾淨 Markdown。"""
+    return runtime.parse_page(png, max_tokens)
+
+
+
+
+def nemotron_to_markdown(text: str) -> str:
+    """移除 Nemotron 的 bbox/class 包裝，保留 reading order 與 Markdown。"""
+    parts = []
+    for match in NEMOTRON_BLOCK_RE.finditer(text):
+        content, cls = match.groups()
+        content = (
+            content.replace("<tbc>", "")
+            .replace(r"\<|unk|\>", "")
+            .replace(r"\unknown", "")
+            .strip()
         )
-    return content
+        if content and cls != "Picture":
+            parts.append(content)
+    if not parts:
+        raise RuntimeError("Nemotron-Parse 2.0 輸出不含可辨識的版面區塊")
+    return "\n\n".join(parts)
 
 
-def strip_fence(text: str) -> str:
-    """小模型常自作主張包上 ```markdown 圍籬，拆掉。"""
-    if not text.startswith("```"):
-        return text
-    lines = text.splitlines()
-    lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-def resolve_model(client, wanted: str | None) -> str:
-    """沒指定 --model 就用 LM Studio 目前載入的第一個模型。"""
-    if wanted:
-        return wanted
-    models = [m.id for m in client.models.list().data]
-    if not models:
-        raise RuntimeError("LM Studio 沒有載入任何模型")
-    return models[0]
 
 
 def to_markdown_file(meta: dict, body: str, source: Path, pages: int) -> str:
@@ -223,52 +266,80 @@ def to_markdown_file(meta: dict, body: str, source: Path, pages: int) -> str:
     return f"---\n{front}---\n\n{body.strip()}\n"
 
 
-def extract_meta(client, meta_model: str, page1_md: str) -> dict:
-    """從第 1 頁的 OCR 文字抽 metadata（純文字，不再看影像）。"""
-    raw = ask(
-        client,
-        meta_model,
-        None,
-        META_PROMPT.format(text=page1_md),
-        META_SCHEMA,
-        META_MAX_TOKENS,
-        system=META_SYSTEM,
-    )
-    meta = json.loads(raw)
+def extract_meta(page1_md: str) -> dict:
+    """從第 1 頁 OCR 文字的固定標籤抽 metadata。"""
+    meta: dict[str, str | list[str]] = {field: "" for field in META_FIELDS}
+    meta["附件"] = []
+
+    for field in META_FIELDS[1:-2]:
+        value = field_value(page1_md, field)
+        if value:
+            meta[field] = value
+
+    attachment = field_value(page1_md, "附件")
+    if attachment and attachment not in {"無", "無附件"}:
+        meta["附件"] = [
+            item.strip()
+            for item in re.split(r"[、；;]", attachment)
+            if item.strip()
+        ]
+
+    meta["發文機關"] = issuing_agency(page1_md)
     meta["文別"] = doc_type(page1_md)
-    meta["主旨"] = subject(page1_md) or meta.get("主旨", "")
+    meta["主旨"] = subject(page1_md)
     return meta
 
 
+def field_value(text: str, field: str) -> str:
+    match = re.search(
+        rf"(?:^|\n)\s*(?:[#>*+\-]+\s*)*{re.escape(field)}[：:][ \t　]*([^\n]*)",
+        text,
+    )
+    return " ".join(match.group(1).strip(" *_`").split()) if match else ""
+
+
+def issuing_agency(page1_md: str) -> str:
+    """從首頁前幾行的「機關全銜 + 文別」取出發文機關。"""
+    for raw_line in page1_md.splitlines()[:8]:
+        line = re.sub(r"^\s*[#>*+\-]+\s*", "", raw_line).strip(" *_`　")
+        for document_type in DOC_TYPES:
+            if line.endswith(document_type) and len(line) > len(document_type):
+                return line[: -len(document_type)].rstrip(" 　")
+    return field_value(page1_md, "發文機關")
+
+
 def subject(page1_md: str) -> str:
-    """從第 1 頁抓主旨全文；抓不到回空字串，由呼叫端沿用模型抽的值。"""
-    m = SUBJECT_RE.search(page1_md)
-    return " ".join(m.group(1).split()) if m else ""
+    """從第 1 頁抓主旨全文。"""
+    match = SUBJECT_RE.search(page1_md)
+    return " ".join(match.group(1).strip(" *_`").split()) if match else ""
 
 
 def doc_type(page1_md: str) -> str:
     """從第 1 頁前幾行的行尾抓文別。"""
-    for line in page1_md.splitlines()[:6]:
-        line = line.strip().rstrip("　 ")
-        for t in DOC_TYPES:
-            if line.endswith(t) and len(line) > len(t):
-                return t
+    for raw_line in page1_md.splitlines()[:8]:
+        line = re.sub(r"^\s*[#>*+\-]+\s*", "", raw_line).strip(" *_`　")
+        for document_type in DOC_TYPES:
+            if line.endswith(document_type) and len(line) > len(document_type):
+                return document_type
     return ""
 
 
-def ocr_pdf(client, model: str, pdf: Path, dpi: int, max_edge: int,
-            max_tokens: int) -> list[str]:
-    """逐頁 OCR，回傳每頁的 Markdown。"""
-    images = render_pages(pdf, dpi, max_edge)
+def ocr_pdf(
+    runtime: NemotronRuntime,
+    pdf: Path,
+    dpi: int,
+    max_width: int,
+    max_height: int,
+    max_tokens: int,
+) -> list[str]:
+    """逐頁以 Nemotron-Parse 2.0 OCR，回傳每頁 Markdown。"""
+    images = render_pages(pdf, dpi, max_width, max_height)
     total = len(images)
     print(f"  已 render {total} 頁，逐頁辨識…", flush=True)
     parts = []
     for i, png in enumerate(images, 1):
         print(f"    第 {i}/{total} 頁…", flush=True)
-        parts.append(
-            strip_fence(ask(client, model, png, PAGE_PROMPT.format(n=i, total=total),
-                            max_tokens=max_tokens))
-        )
+        parts.append(parse_page(runtime, png, max_tokens))
     return parts
 
 
@@ -294,7 +365,6 @@ def write_doc(pdf: Path, outdir: Path, parts: list[str], meta: dict) -> Path:
 
 
 def main() -> int:
-    load_dotenv()  # 要在 add_argument 之前，default 才吃得到 .env 的值
     ap = argparse.ArgumentParser(description="公文 PDF OCR 轉 Markdown（地端模型）")
     ap.add_argument("pdfs", nargs="*", help=f"PDF 檔案（預設：{DEFAULT_INDIR}/ 底下所有 .pdf）")
     ap.add_argument("-i", "--indir", default=DEFAULT_INDIR,
@@ -302,28 +372,30 @@ def main() -> int:
     ap.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR,
                     help=f"輸出目錄（預設：{DEFAULT_OUTDIR}/）")
     ap.add_argument(
-        "--base-url",
-        default=os.environ.get("LM_STUDIO_BASE_URL", DEFAULT_BASE_URL),
-        help="OpenAI 相容端點（或設 .env 的 LM_STUDIO_BASE_URL）",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Hugging Face 模型 ID 或本機目錄（預設 {DEFAULT_MODEL}）",
     )
-    ap.add_argument("--model", help="OCR 模型名稱（預設：用 LM Studio 已載入的第一個）")
     ap.add_argument(
-        "--meta-model",
-        default=os.environ.get("LM_STUDIO_META_MODEL"),
-        help="抽 metadata 的文字模型（預設同 --model；OCR 專用模型請另外指定一個文字模型）",
+        "--device",
+        default="auto",
+        help="Transformers 裝置（預設 auto，自動使用 cuda:0 或 cpu）",
+    )
+    ap.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="只使用 Hugging Face cache 或 --model 指定的本機檔案",
     )
     ap.add_argument("--no-meta", action="store_true", help="只輸出內文，不抽 metadata")
     ap.add_argument(
-        "--api-key",
-        default=os.environ.get("LM_STUDIO_API_KEY", "local"),
-        help="LM Studio API token（或設環境變數 LM_STUDIO_API_KEY；未開驗證時免填）",
-    )
-    ap.add_argument(
         "--max-tokens", type=int, default=PAGE_MAX_TOKENS,
-        help=f"每頁輸出上限（預設 {PAGE_MAX_TOKENS}；reasoning 模型要留 thinking 的量）",
+        help=f"每頁輸出上限（預設 {PAGE_MAX_TOKENS}）",
     )
     ap.add_argument("--dpi", type=int, default=RENDER_DPI, help=f"render DPI（預設 {RENDER_DPI}）")
-    ap.add_argument("--max-edge", type=int, default=MAX_EDGE, help=f"影像長邊上限（預設 {MAX_EDGE}）")
+    ap.add_argument("--max-width", type=int, default=MAX_WIDTH,
+                    help=f"影像寬度上限（預設 {MAX_WIDTH}）")
+    ap.add_argument("--max-height", type=int, default=MAX_HEIGHT,
+                    help=f"影像高度上限（預設 {MAX_HEIGHT}）")
     args = ap.parse_args()
 
     paths = collect_pdfs(args.pdfs, args.indir)
@@ -334,51 +406,37 @@ def main() -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # LM Studio 未開驗證時 token 隨便填即可，但 SDK 硬性要求非空字串。
-    client = openai.OpenAI(base_url=args.base_url, api_key=args.api_key, timeout=600)
+    print(f"載入 OCR 模型 {args.model}…", flush=True)
     try:
-        model = resolve_model(client, args.model)
+        runtime = NemotronRuntime(args.model, args.device, args.local_files_only)
     except Exception as e:
-        print(f"連不到 {args.base_url}：{e}", file=sys.stderr)
+        print(f"Nemotron 模型載入失敗：{e}", file=sys.stderr)
         return 1
-    meta_model = None if args.no_meta else (args.meta_model or model)
-    print(f"端點 {args.base_url}，OCR 模型 {model}"
-          + (f"，metadata 模型 {meta_model}" if meta_model else "，不抽 metadata"))
+    print(f"Direct Transformers，裝置 {runtime.device}，OCR 模型 {args.model}"
+          + ("，不抽 metadata" if args.no_meta else "，metadata 使用固定欄位抽取"))
 
-    # 先把所有文件 OCR 完，再統一抽 metadata。兩個模型交錯呼叫會讓 LM Studio
-    # 一直換載入，實測會把模型跑到 crash。
-    # 每份文件的時間分兩段累計（OCR、metadata），最後一起報。
-    done: list[tuple[Path, list[str], float]] = []
+    total_secs = 0.0
     failed = 0
     for pdf in paths:
         print(f"處理 {pdf.name}")
-        t0 = time.time()
+        started = time.time()
         try:
-            parts = ocr_pdf(client, model, pdf, args.dpi, args.max_edge,
-                            args.max_tokens)
-            secs = time.time() - t0
-            done.append((pdf, parts, secs))
-            print(f"  OCR {secs:.1f} 秒（{secs / max(len(parts), 1):.1f} 秒/頁）")
+            parts = ocr_pdf(
+                runtime,
+                pdf,
+                args.dpi,
+                args.max_width,
+                args.max_height,
+                args.max_tokens,
+            )
+            meta = {} if args.no_meta or not parts else extract_meta(parts[0])
+            elapsed = time.time() - started
+            total_secs += elapsed
+            print(f"  -> {write_doc(pdf, outdir, parts, meta)}"
+                  f"（{elapsed:.1f} 秒，{elapsed / max(len(parts), 1):.1f} 秒/頁）")
         except Exception as e:
             failed += 1
-            print(f"  失敗：{e}（{time.time() - t0:.1f} 秒）", file=sys.stderr)
-
-    total_secs = 0.0
-    for pdf, parts, ocr_secs in done:
-        meta = {}
-        t0 = time.time()
-        if meta_model and parts:
-            print(f"抽 metadata {pdf.name}（{meta_model}）…", flush=True)
-            try:
-                meta = extract_meta(client, meta_model, parts[0])
-            except (json.JSONDecodeError, openai.APIError, RuntimeError) as e:
-                # 抽不到 metadata 不該讓已經辨識好的內文一起白費。
-                print(f"  metadata 抽取失敗（{e}），改為只輸出內文", file=sys.stderr)
-        meta_secs = time.time() - t0
-        total_secs += ocr_secs + meta_secs
-        print(f"  -> {write_doc(pdf, outdir, parts, meta)}"
-              f"（共 {ocr_secs + meta_secs:.1f} 秒＝OCR {ocr_secs:.1f}"
-              f" + metadata {meta_secs:.1f}）")
+            print(f"  失敗：{e}（{time.time() - started:.1f} 秒）", file=sys.stderr)
 
     print(f"\n完成 {len(paths) - failed}/{len(paths)} 份，共 {total_secs:.1f} 秒")
     return 1 if failed else 0

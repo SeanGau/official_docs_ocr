@@ -1,4 +1,5 @@
 .env
+.venv/
 *.pdf
 __pycache__/
 bench_out/

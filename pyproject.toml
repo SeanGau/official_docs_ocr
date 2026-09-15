@@ -1,0 +1,33 @@
+[project]
+name = "official-doc-parser"
+version = "0.1.0"
+description = "Taiwan official-document PDF to Markdown parser"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+cloud = [
+    "anthropic",
+    "openai",
+]
+local = [
+    "accelerate==1.12.0",
+    "beautifulsoup4",
+    "einops==0.8.1",
+    "numpy",
+    "open-clip-torch==3.2.0",
+    "opencv-python-headless",
+    "pillow",
+    "timm==1.0.22",
+    "torch",
+    "transformers==5.6.1",
+]
+bench = [
+    "opencc-python-reimplemented",
+]
+
+[tool.uv]
+package = false
