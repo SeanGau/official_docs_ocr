@@ -99,6 +99,18 @@ def render_pages(
 
 
 PAGE_MAX_TOKENS = 8192
+BLANK_PIXEL_THRESHOLD = 245
+BLANK_MAX_INK_RATIO = 0.0005
+
+
+def _is_blank_page(image: Image.Image) -> bool:
+    """判斷頁面是否只有白底或極少量 render 雜點。"""
+    with image.convert("L") as grayscale:
+        histogram = grayscale.histogram()
+        ink_pixels = sum(histogram[:BLANK_PIXEL_THRESHOLD])
+        return ink_pixels <= grayscale.width * grayscale.height * BLANK_MAX_INK_RATIO
+
+
 
 
 class _MessageFilter(logging.Filter):
@@ -186,8 +198,11 @@ class NemotronRuntime:
             self.generation_config = GenerationConfig.from_pretrained(model_path, **load_args)
 
     def parse_page(self, png: bytes, max_tokens: int) -> str:
+        """解析一頁；視覺上為空白時回傳空字串，不執行模型。"""
         with Image.open(BytesIO(png)) as source:
             image = source.convert("RGB")
+        if _is_blank_page(image):
+            return ""
         inputs = self.processor(
             images=[image],
             text=NEMOTRON_PROMPT,
@@ -226,7 +241,7 @@ class NemotronRuntime:
 
 
 def parse_page(runtime: NemotronRuntime, png: bytes, max_tokens: int = PAGE_MAX_TOKENS) -> str:
-    """以 Direct Transformers 解析單頁，回傳乾淨 Markdown。"""
+    """以 Direct Transformers 解析單頁；空白頁回傳空字串。"""
     return runtime.parse_page(png, max_tokens)
 
 
@@ -339,7 +354,10 @@ def ocr_pdf(
     parts = []
     for i, png in enumerate(images, 1):
         print(f"    第 {i}/{total} 頁…", flush=True)
-        parts.append(parse_page(runtime, png, max_tokens))
+        part = parse_page(runtime, png, max_tokens)
+        parts.append(part)
+        if not part:
+            print("      空白頁，保留頁數並繼續處理", flush=True)
     return parts
 
 
