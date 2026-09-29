@@ -1,0 +1,14 @@
+OfficialDocOCR 使用的第三方模型檔案
+（內附版放在 _internal\hf_hub；未內附時由程式下載到 %LOCALAPPDATA%\OfficialDocParser\hf_hub）
+
+1. NVIDIA Nemotron-Parse 2.0（權重、設定、tokenizer 與 remote code）
+   來源：https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-2.0
+   授權：OpenMDW License Agreement, version 1.1  https://openmdw.ai/license/1-1/
+         tokenizer 另依 CC-BY-4.0  https://creativecommons.org/licenses/by/4.0/
+   全文：hf_hub\models--nvidia--NVIDIA-Nemotron-Parse-2.0\snapshots\<commit>\LICENSE
+
+2. NVIDIA C-RADIOv2-H（僅 remote code，不含權重）
+   來源：https://huggingface.co/nvidia/C-RADIOv2-H
+   授權：Licensed by NVIDIA Corporation under the NVIDIA Open Model License
+   全文：NVIDIA-Open-Model-License.pdf（同資料夾）
+         https://developer.download.nvidia.com/licenses/nvidia-open-model-license-agreement-june-2024.pdf

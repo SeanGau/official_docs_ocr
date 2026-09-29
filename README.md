@@ -17,6 +17,9 @@
 看進度、下載 `.md`）。辨識邏輯與 `ocr_doc.py` 的 OpenAI 路徑一致，輸出格式相同；
 目前只接 OpenAI，沒有 `-p claude` 的對應選項。
 
+地端版另有桌面程式 [`ocr_app.py`](#地端版-windows-桌面程式)：視窗操作，可打包成 Windows exe，
+模型內附或首次開啟時下載一次，之後完全離線。
+
 ## 安裝
 
 Python 3.10+，使用 [uv](https://docs.astral.sh/uv/) 管理相依套件。依要執行的版本安裝：
@@ -104,6 +107,52 @@ uv run --extra local ocr_doc_local.py --no-meta
 模型輸入使用官方建議的 `1664×2048` 上限與控制 token；Transformers 產生的 bbox/class
 包裝會在寫檔前移除，只保留 reading order 中的 Markdown。metadata 不再呼叫語言模型，
 而是從首頁的「受文者」、「發文日期」、「發文字號」等固定標籤確定性抽取。
+
+### 地端版 Windows 桌面程式
+
+`ocr_app.py` 是地端版的視窗介面（Tk），與 `ocr_doc_local.py` 共用同一套 OCR 與輸出格式。
+打包後雙擊 `OfficialDocOCR.exe`：選 PDF 或資料夾、選輸出資料夾、按「開始轉換」，
+逐頁顯示進度，輸出 `<檔名>.local.md`；可在任一頁完成後停止。
+
+```bash
+uv run --extra local ocr_app.py                 # 從原始碼執行
+uv run --extra local ocr_app.py input/a.pdf     # 開啟時先加入檔案或資料夾
+```
+
+**開啟時的離線檢查**：模型版本固定在 `model_manifest.json`（repo、commit、每個檔案大小）。
+程式開啟時只比對本機檔案，不連網，依序找：exe 內附的 `_internal\hf_hub` →
+`%LOCALAPPDATA%\OfficialDocParser\hf_hub` → 使用者既有的 Hugging Face cache。
+
+- 找到完整的一份：顯示「離線資源完整，不需要網路」，之後全程離線（`HF_HUB_OFFLINE=1`）。
+- 都不完整：顯示缺幾個檔、需要下載多少，按「下載模型」後在子程序下載到
+  `%LOCALAPPDATA%\OfficialDocParser\hf_hub`，顯示進度、速度與估計剩餘時間，可取消；
+  完成的檔案會保留，下次只下載缺少的部分。
+
+程式紀錄（含錯誤的完整 traceback）寫在 `%LOCALAPPDATA%\OfficialDocParser\app.log`。
+
+#### 打包成 exe
+
+在 Windows 上（需要 [uv](https://docs.astral.sh/uv/)）用 PyInstaller 打包，執行時不需要 Python：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\build.ps1            # 內附模型，完全離線
+powershell -ExecutionPolicy Bypass -File windows\build.ps1 -NoModel   # 不附模型，首次開啟時下載
+```
+
+- venv、暫存與成品都放在 `%USERPROFILE%\official_doc_parser_build`（可用 `-BuildRoot` 改），
+  不動 repo 內給 Linux/WSL 用的 `.venv`；repo 放在 `\\wsl.localhost\...` 也能直接建置。
+- 成品是 `dist\OfficialDocOCR\` 整個資料夾（內附模型約 6.5 GB，`-NoModel` 約 3.1 GB），
+  要整包複製或壓縮；單拿 `OfficialDocOCR.exe` 無法執行。
+- 內附版的模型在建置時由 `python model_store.py stage` 依 manifest 下載，整理成不含 symlink
+  的 Hugging Face cache 放進 `_internal\hf_hub`，搬到別台電腦也能用。
+- 成品根目錄有 `NOTICE.txt` 與 `NVIDIA-Open-Model-License.pdf`（C-RADIOv2-H 的 NVIDIA Open
+  Model License §3.1 要求），Nemotron 的 `LICENSE` 在模型 snapshot 裡。複製時一起帶走。
+- Windows 的 torch 由 `pyproject.toml` 指定從 PyTorch 的 CUDA 13.0 index 安裝：
+  需要 Turing（RTX 20 系列）以後的 NVIDIA GPU 與 R580 以上的驅動；沒有 GPU 就退回 CPU，
+  但一頁要十幾分鐘、記憶體約 6.5 GB。
+
+要換模型版本：改 `model_store.py` 的 `PINNED`，執行 `uv run --extra local python model_store.py manifest`
+重新產生 `model_manifest.json`，再重新建置。
 
 ## 輸出格式
 

@@ -1,0 +1,52 @@
+{
+  "repos": [
+    {
+      "repo": "nvidia/NVIDIA-Nemotron-Parse-2.0",
+      "commit": "b6742064f4a8cf22a10383ece5e7fbead355ac04",
+      "files": {
+        "LICENSE": 2980,
+        "README.md": 19946,
+        "chat_template.jinja": 66,
+        "config.json": 10927,
+        "generation_config.json": 284,
+        "hf_nemotron_parse_config.py": 5280,
+        "hf_nemotron_parse_modeling.py": 35091,
+        "hf_nemotron_parse_processor.py": 15961,
+        "model.safetensors": 3612281104,
+        "preprocessor_config.json": 720,
+        "processor_config.json": 287,
+        "special_tokens_map.json": 747,
+        "tokenizer.json": 7580523,
+        "tokenizer_config.json": 414355
+      }
+    },
+    {
+      "repo": "nvidia/C-RADIOv2-H",
+      "commit": "0d8f4c18c877166eda07ddae1386bcad256b7a6a",
+      "files": {
+        "README.md": 10990,
+        "adaptor_base.py": 1207,
+        "adaptor_generic.py": 3306,
+        "adaptor_mlp.py": 6017,
+        "adaptor_registry.py": 1371,
+        "cls_token.py": 1787,
+        "common.py": 3869,
+        "dinov2_arch.py": 35529,
+        "dual_hybrid_vit.py": 7179,
+        "enable_cpe_support.py": 6022,
+        "enable_spectral_reparam.py": 11004,
+        "eradio_model.py": 58123,
+        "extra_models.py": 5691,
+        "extra_timm_models.py": 8205,
+        "feature_normalizer.py": 4399,
+        "forward_intermediates.py": 5604,
+        "hf_model.py": 7758,
+        "input_conditioner.py": 1492,
+        "open_clip_adaptor.py": 1550,
+        "radio_model.py": 13217,
+        "vit_patch_generator.py": 10961,
+        "vitdet.py": 6318
+      }
+    }
+  ]
+}

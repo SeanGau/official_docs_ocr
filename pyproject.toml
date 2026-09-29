@@ -23,11 +23,26 @@ local = [
     "pillow",
     "timm==1.0.22",
     "torch",
+    "torchvision",
     "transformers==5.6.1",
 ]
 bench = [
     "opencc-python-reimplemented",
 ]
+exe = [
+    "pyinstaller",
+]
 
 [tool.uv]
 package = false
+
+# Windows 的 PyPI torch 只有 CPU 版；Windows 改從 PyTorch 官方 CUDA 13.0 index 安裝
+# （支援 Turing 到 Blackwell，驅動需 R580 以上）。Linux 維持 PyPI。
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]

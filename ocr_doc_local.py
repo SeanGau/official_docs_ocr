@@ -21,6 +21,7 @@ import re
 import sys
 import time
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
@@ -346,14 +347,20 @@ def ocr_pdf(
     max_width: int,
     max_height: int,
     max_tokens: int,
+    on_page: Callable[[int, int], None] | None = None,
 ) -> list[str]:
-    """逐頁以 Nemotron-Parse 2.0 OCR，回傳每頁 Markdown。"""
+    """逐頁以 Nemotron-Parse 2.0 OCR，回傳每頁 Markdown。
+
+    on_page(第幾頁, 總頁數) 在每頁辨識前呼叫；GUI 用它更新進度，也可在裡面丟例外中止。
+    """
     images = render_pages(pdf, dpi, max_width, max_height)
     total = len(images)
     print(f"  已 render {total} 頁，逐頁辨識…", flush=True)
     parts = []
     for i, png in enumerate(images, 1):
         print(f"    第 {i}/{total} 頁…", flush=True)
+        if on_page:
+            on_page(i, total)
         part = parse_page(runtime, png, max_tokens)
         parts.append(part)
         if not part:
