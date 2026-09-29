@@ -8,6 +8,7 @@
     "start": "node server.mjs"
   },
   "dependencies": {
+    "@google/genai": "^2.22.0",
     "mupdf": "^1.28.0",
     "openai": "^7.5.0",
     "yaml": "^2.9.0"

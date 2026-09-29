@@ -4,13 +4,13 @@
  *
  * 用法：
  *   npm install
- *   OPENAI_API_KEY=sk-... node server.mjs      # 或把金鑰放 ../.env
+ *   GEMINI_API_KEY=... node server.mjs        # 也支援 OPENAI_API_KEY
  *   瀏覽器開 http://localhost:8787
  *
  * 路由：
  *   GET  /                 單頁 UI
- *   GET  /api/config       前端要用的預設值（模型名稱、頁數上限）
- *   POST /api/convert?name=x.pdf
+ *   GET  /api/config       前端要用的供應商、預設模型與頁數上限
+ *   POST /api/convert?name=x.pdf&provider=gemini
  *        body 直接是 PDF 原始 bytes（不走 multipart，省一個依賴），
  *        回應是 SSE：status / progress / done / error。
  */
@@ -20,7 +20,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import OpenAI from "openai";
-import { convert, DEFAULT_MODEL, MAX_PAGES_PER_REQUEST } from "./ocr.mjs";
+import { GoogleGenAI } from "@google/genai";
+import { convert, DEFAULT_MODELS, MAX_PAGES_PER_REQUEST } from "./ocr.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, "public");
@@ -28,6 +29,41 @@ const PUBLIC = path.join(HERE, "public");
 // 上傳大小上限。20 頁的掃描公文大概幾 MB，50MB 已經很寬鬆，
 // 主要是避免有人一直灌 body 把記憶體吃光。
 const MAX_UPLOAD = 50 * 1024 * 1024;
+
+const PROVIDERS = Object.freeze({
+  openai: {
+    label: "OpenAI",
+    apiKeyEnv: "OPENAI_API_KEY",
+    modelEnv: "OPENAI_MODEL",
+    defaultModel: DEFAULT_MODELS.openai,
+    makeClient: (apiKey) => new OpenAI({ apiKey, timeout: 1800_000 }),
+  },
+  gemini: {
+    label: "Gemini",
+    apiKeyEnv: "GEMINI_API_KEY",
+    modelEnv: "GEMINI_MODEL",
+    defaultModel: DEFAULT_MODELS.gemini,
+    makeClient: (apiKey) => new GoogleGenAI({ apiKey }),
+  },
+});
+
+function chooseDefaultProvider() {
+  const requested = process.env.OCR_PROVIDER?.trim().toLowerCase();
+  if (requested) {
+    if (!Object.hasOwn(PROVIDERS, requested)) {
+      throw new Error(`OCR_PROVIDER 不支援「${requested}」，可用值：${Object.keys(PROVIDERS).join(", ")}`);
+    }
+    return requested;
+  }
+  // 只放 Gemini key 時自動選 Gemini；其餘情況維持既有的 OpenAI 預設。
+  if (!process.env.OPENAI_API_KEY && process.env.GEMINI_API_KEY) return "gemini";
+  return "openai";
+}
+
+function providerModel(name) {
+  const provider = PROVIDERS[name];
+  return process.env[provider.modelEnv] || provider.defaultModel;
+}
 
 /**
  * 把 .env 的 KEY=VALUE 塞進 process.env（已存在的環境變數優先）。
@@ -75,12 +111,18 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-async function handleConvert(getClient, req, res, url) {
+async function handleConvert(getClient, defaultProvider, req, res, url) {
   const name = url.searchParams.get("name") || "document.pdf";
   if (!name.toLowerCase().endsWith(".pdf")) {
     sendJson(res, 400, { error: "只接受 .pdf 檔" });
     return;
   }
+  const providerName = (url.searchParams.get("provider") || defaultProvider).toLowerCase();
+  if (!Object.hasOwn(PROVIDERS, providerName)) {
+    sendJson(res, 400, { error: `不支援的模型供應商：${providerName}` });
+    return;
+  }
+
 
   let buf;
   try {
@@ -105,10 +147,10 @@ async function handleConvert(getClient, req, res, url) {
   // 心跳：長工作中間沒有事件時，讓中介的 proxy 知道連線還活著。
   const beat = setInterval(() => res.write(":\n\n"), 15000);
 
-  const model = url.searchParams.get("model") || process.env.OPENAI_MODEL || DEFAULT_MODEL;
-  send({ type: "status", msg: `讀入 ${name}，正在轉成影像…` });
+  const model = url.searchParams.get("model") || providerModel(providerName);
+  send({ type: "status", msg: `讀入 ${name}，正在分析 PDF…` });
   try {
-    const out = await convert(getClient(), model, new Uint8Array(buf), name, send);
+    const out = await convert(getClient(providerName), providerName, model, buf, name, send);
     send({ type: "done", ...out });
   } catch (e) {
     console.error(`[convert] ${name}: ${e.stack ?? e.message}`);
@@ -135,28 +177,46 @@ function serveStatic(res, urlPath) {
 
 function main() {
   loadDotenv();
-  if (!process.env.OPENAI_API_KEY) {
-    console.warn("警告：沒有讀到 OPENAI_API_KEY，轉檔時會失敗。請設環境變數或寫進 .env。");
+  const defaultProvider = chooseDefaultProvider();
+  const selected = PROVIDERS[defaultProvider];
+  if (!process.env[selected.apiKeyEnv]) {
+    console.warn(
+      `警告：沒有讀到 ${selected.apiKeyEnv}，${selected.label} 轉檔會失敗。` +
+      "請設環境變數或寫進 .env。",
+    );
   }
-  // 延後建立 client：沒金鑰時讓錯誤在轉檔時回報給前端，而不是讓服務起不來。
-  // 多頁高解析度影像 + high effort 推理，單份跑好幾分鐘是常態，
-  // SDK 預設的 timeout 不夠用（對齊 ocr_doc.py）。
-  let client = null;
-  const getClient = () => {
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error("沒有設定 OPENAI_API_KEY，請設環境變數或寫進 .env 後重啟服務");
+  // 每家 client 都延後建立：缺金鑰時讓錯誤在轉檔時回報前端，而不是讓服務起不來。
+  // 多頁文件可能跑好幾分鐘，OpenAI client 使用 30 分鐘 timeout；
+  // Gemini 的單次 request timeout 則設在 extractGemini。
+  const clients = new Map();
+  const getClient = (name) => {
+    const provider = PROVIDERS[name];
+    const apiKey = process.env[provider.apiKeyEnv];
+    if (!apiKey) {
+      throw new Error(`沒有設定 ${provider.apiKeyEnv}，請設環境變數或寫進 .env 後重啟服務`);
     }
-    client ??= new OpenAI({ timeout: 1800_000 });
-    return client;
+    if (!clients.has(name)) clients.set(name, provider.makeClient(apiKey));
+    return clients.get(name);
   };
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
     if (req.method === "POST" && url.pathname === "/api/convert") {
-      handleConvert(getClient, req, res, url);
+      handleConvert(getClient, defaultProvider, req, res, url);
     } else if (req.method === "GET" && url.pathname === "/api/config") {
       sendJson(res, 200, {
-        model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+        provider: defaultProvider,
+        model: providerModel(defaultProvider),
+        providers: Object.fromEntries(
+          Object.entries(PROVIDERS).map(([name, provider]) => [
+            name,
+            {
+              label: provider.label,
+              model: providerModel(name),
+              available: Boolean(process.env[provider.apiKeyEnv]),
+            },
+          ]),
+        ),
         maxPages: MAX_PAGES_PER_REQUEST,
         maxUploadMB: MAX_UPLOAD / 1024 / 1024,
       });

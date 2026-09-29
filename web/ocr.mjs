@@ -1,16 +1,19 @@
 /**
  * 公文 PDF -> Markdown（含 YAML frontmatter metadata）
  *
- * 這是 ../ocr_doc.py 的 JavaScript 移植：用 MuPDF 把掃描 PDF 每頁轉成點陣圖，
- * 交給 OpenAI 視覺模型做 OCR + 版面重建 + metadata 抽取，組成 .md 文字。
+ * 這是 ../ocr_doc.py 的 JavaScript 移植：用 MuPDF 讀取掃描 PDF，
+ * 交給 OpenAI 或 Gemini 視覺模型做 OCR + 版面重建 + metadata 抽取，組成 .md 文字。
  *
- * prompt、schema、頁碼標記、各種上限都與 Python 版逐字一致，兩邊產出的 .md 可以互換。
+ * prompt、schema、頁碼標記、各種上限都與 Python 版一致，產出的 .md 可以互換。
  */
 
 import * as mupdf from "mupdf";
 import YAML from "yaml";
 
-export const DEFAULT_MODEL = "gpt-5";
+export const DEFAULT_MODELS = Object.freeze({
+  openai: "gpt-5",
+  gemini: "gemini-3.8-flash",
+});
 
 // OpenAI 視覺輸入會先把影像縮到 2048x2048 以內，長邊超過就是白花 token。
 const MAX_EDGE = 2048;
@@ -126,6 +129,16 @@ const SCHEMA = {
   },
 };
 
+/** 只讀 PDF 頁數；Gemini 原生接收 PDF，不需要先配置每頁點陣圖。 */
+function countPages(buf) {
+  const doc = mupdf.Document.openDocument(buf, "application/pdf");
+  try {
+    return doc.countPages();
+  } finally {
+    doc.destroy();
+  }
+}
+
 /** 把 PDF 每頁 render 成 PNG bytes，長邊不超過 MAX_EDGE。 */
 export function renderPages(buf) {
   const images = [];
@@ -163,7 +176,7 @@ export function renderPages(buf) {
   return images;
 }
 
-function buildContent(images) {
+function buildContentOpenAI(images) {
   const content = [];
   images.forEach((png, idx) => {
     content.push({ type: "input_text", text: `--- 第 ${idx + 1} 頁 ---` });
@@ -180,10 +193,10 @@ function buildContent(images) {
 }
 
 /**
- * 呼叫模型做 OCR + 抽 metadata，回傳 {metadata, pages}。
+ * 呼叫 OpenAI 做 OCR + 抽 metadata，回傳 {metadata, pages}。
  * onProgress(chars) 會在模型輸出過程中被呼叫，用來推進度給前端。
  */
-export async function extract(client, model, images, onProgress) {
+export async function extractOpenAI(client, model, images, onProgress) {
   // 影像多、輸出長，一律 streaming 避免 HTTP timeout。
   const stream = client.responses.stream({
     model,
@@ -198,7 +211,7 @@ export async function extract(client, model, images, onProgress) {
         strict: true,
       },
     },
-    input: [{ role: "user", content: buildContent(images) }],
+    input: [{ role: "user", content: buildContentOpenAI(images) }],
   });
 
   let chars = 0;
@@ -226,6 +239,52 @@ export async function extract(client, model, images, onProgress) {
   }
 
   return JSON.parse(response.output_text);
+}
+
+/**
+ * 呼叫 Gemini 原生讀取 PDF。PDF 直接作為 document 傳入，避免 20 頁 PNG
+ * 膨脹後超過多模態 request 上限，也省掉 Gemini 路徑不需要的 render。
+ */
+export async function extractGemini(client, model, pdf, onProgress) {
+  const data = Buffer.isBuffer(pdf)
+    ? pdf.toString("base64")
+    : Buffer.from(pdf.buffer, pdf.byteOffset, pdf.byteLength).toString("base64");
+  const stream = await client.interactions.create(
+    {
+      model,
+      input: [
+        { type: "document", data, mime_type: "application/pdf" },
+        { type: "text", text: USER_PROMPT },
+      ],
+      system_instruction: SYSTEM_PROMPT,
+      generation_config: {
+        max_output_tokens: 32000,
+        thinking_level: "high",
+      },
+      response_format: {
+        type: "text",
+        mime_type: "application/json",
+        schema: SCHEMA,
+      },
+      stream: true,
+    },
+    { timeout_ms: 1_800_000 },
+  );
+
+  let text = "";
+  for await (const event of stream) {
+    if (event.event_type === "error") {
+      throw new Error(`Gemini 回應失敗：${event.error?.message ?? event.error?.code ?? "未知錯誤"}`);
+    }
+    if (event.event_type === "step.delta" && event.delta?.type === "text") {
+      text += event.delta.text;
+      onProgress?.(text.length);
+    }
+  }
+  if (!text) {
+    throw new Error("Gemini 沒有回傳內容");
+  }
+  return JSON.parse(text);
 }
 
 /**
@@ -264,30 +323,48 @@ function toMarkdownFile(result, sourceName, pages) {
 }
 
 /**
- * 完整流程：render -> 辨識 -> 組 Markdown。
+ * 完整流程：讀 PDF -> 辨識 -> 組 Markdown。
  * onEvent({type, ...}) 用來回報進度，型別與 SSE 事件一致。
  */
-export async function convert(client, model, buf, sourceName, onEvent = () => {}) {
-  const images = renderPages(buf);
-  if (images.length === 0) {
-    throw new Error("這份 PDF 沒有任何頁面");
+export async function convert(client, provider, model, buf, sourceName, onEvent = () => {}) {
+  let total;
+  let result;
+  if (provider === "openai") {
+    const images = renderPages(buf);
+    total = images.length;
+    if (total === 0) {
+      throw new Error("這份 PDF 沒有任何頁面");
+    }
+    if (total > MAX_PAGES_PER_REQUEST) {
+      throw new Error(`${sourceName} 有 ${total} 頁，超過單次上限 ${MAX_PAGES_PER_REQUEST}`);
+    }
+    onEvent({ type: "status", msg: `已 render ${total} 頁，送出 OpenAI 辨識…`, pages: total });
+    result = await extractOpenAI(client, model, images, (chars) => {
+      onEvent({ type: "progress", chars });
+    });
+  } else if (provider === "gemini") {
+    total = countPages(buf);
+    if (total === 0) {
+      throw new Error("這份 PDF 沒有任何頁面");
+    }
+    if (total > MAX_PAGES_PER_REQUEST) {
+      throw new Error(`${sourceName} 有 ${total} 頁，超過單次上限 ${MAX_PAGES_PER_REQUEST}`);
+    }
+    onEvent({ type: "status", msg: `已讀取 ${total} 頁，送出 Gemini 辨識…`, pages: total });
+    result = await extractGemini(client, model, buf, (chars) => {
+      onEvent({ type: "progress", chars });
+    });
+  } else {
+    throw new Error(`不支援的模型供應商：${provider}`);
   }
-  if (images.length > MAX_PAGES_PER_REQUEST) {
-    throw new Error(`${sourceName} 有 ${images.length} 頁，超過單次上限 ${MAX_PAGES_PER_REQUEST}`);
-  }
-  onEvent({ type: "status", msg: `已 render ${images.length} 頁，送出辨識…`, pages: images.length });
-
-  const result = await extract(client, model, images, (chars) => {
-    onEvent({ type: "progress", chars });
-  });
-  if (result.pages.length !== images.length) {
+  if (result.pages.length !== total) {
     // 頁碼標記是給 RAG 溯源用的，對不上就等於引用錯頁，寧可讓它爆掉。
-    throw new Error(`模型回了 ${result.pages.length} 頁，與輸入的 ${images.length} 頁不符`);
+    throw new Error(`模型回了 ${result.pages.length} 頁，與輸入的 ${total} 頁不符`);
   }
 
   const stem = sourceName.replace(/\.pdf$/i, "");
   return {
     filename: `${stem}.md`,
-    markdown: toMarkdownFile(result, sourceName, images.length),
+    markdown: toMarkdownFile(result, sourceName, total),
   };
 }

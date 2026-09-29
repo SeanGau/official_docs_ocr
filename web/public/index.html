@@ -36,7 +36,7 @@
   #drop span { color: var(--muted); font-size: .875rem; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; }
   label { color: var(--muted); font-size: .875rem; }
-  input[type=text] {
+  select, input[type=text] {
     flex: 1; min-width: 12rem; padding: .5rem .65rem; border: 1px solid var(--line);
     border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; font-size: .9rem;
   }
@@ -73,6 +73,11 @@
     </div>
     <input type="file" id="file" accept="application/pdf,.pdf" hidden>
     <div class="row">
+      <label for="provider">供應商</label>
+      <select id="provider">
+        <option value="openai">OpenAI</option>
+        <option value="gemini">Gemini</option>
+      </select>
       <label for="model">模型</label>
       <input type="text" id="model" placeholder="載入中…">
       <button id="go" disabled>開始轉換</button>
@@ -99,12 +104,23 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let file = null, busy = false;
+let file = null, busy = false, providerModels = {};
 
 fetch("/api/config").then(r => r.json()).then(cfg => {
+  providerModels = Object.fromEntries(
+    Object.entries(cfg.providers).map(([name, provider]) => [name, provider.model]),
+  );
+  $("provider").innerHTML = Object.entries(cfg.providers).map(([name, provider]) =>
+    `<option value="${name}">${escapeHtml(provider.label)}${provider.available ? "" : "（未設定 API key）"}</option>`,
+  ).join("");
+  $("provider").value = cfg.provider;
   $("model").value = cfg.model;
   $("hint").textContent = `或點一下選擇檔案（單份上限 ${cfg.maxPages} 頁、${cfg.maxUploadMB}MB）`;
-}).catch(() => { $("model").placeholder = "gpt-5"; });
+}).catch(() => { $("model").placeholder = "gpt-5 或 gemini-3.8-flash"; });
+
+$("provider").onchange = () => {
+  $("model").value = providerModels[$("provider").value] ?? "";
+};
 
 function pick(f) {
   if (!f) return;
@@ -153,7 +169,11 @@ $("go").onclick = async () => {
   const tick = setInterval(renderMeta, 1000);
 
   try {
-    const qs = new URLSearchParams({ name: file.name, model: $("model").value.trim() });
+    const qs = new URLSearchParams({
+      name: file.name,
+      provider: $("provider").value,
+      model: $("model").value.trim(),
+    });
     const res = await fetch(`/api/convert?${qs}`, {
       method: "POST",
       headers: { "content-type": "application/pdf" },

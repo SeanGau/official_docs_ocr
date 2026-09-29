@@ -7,15 +7,15 @@
 
 | | `ocr_doc.py`（雲端） | `ocr_doc_local.py`（地端） |
 | --- | --- | --- |
-| 模型 | OpenAI GPT-5 或 Claude Opus 5，用 `-p` 選 | NVIDIA Nemotron-Parse 2.0（固定） |
+| 模型 | OpenAI GPT-5、Claude Opus 5 或 Gemini，用 `-p` 選 | NVIDIA Nemotron-Parse 2.0（固定） |
 | 文件外傳 | 會 | 不會 |
-| 送件方式 | 整份文件一次送出，可跨頁理解 | 逐頁辨識再串接 |
+| 送件方式 | OpenAI/Claude 逐頁 render 後整份送出；Gemini 原生讀取整份 PDF | 逐頁辨識再串接 |
 | metadata | 18 個欄位，與正文同一次結構化輸出 | 從第 1 頁 OCR 文字的固定標籤抽取 |
 | 輸出檔名 | `<檔名>.md` | `<檔名>.local.md` |
 
-另有 [`web/`](web/)：雲端版的 JavaScript 移植，包成網頁服務（拖 PDF 進瀏覽器、
-看進度、下載 `.md`）。辨識邏輯與 `ocr_doc.py` 的 OpenAI 路徑一致，輸出格式相同；
-目前只接 OpenAI，沒有 `-p claude` 的對應選項。
+另有 [`web/`](web/)：雲端版的 JavaScript 網頁服務（拖 PDF、看進度、下載 `.md`），
+支援 OpenAI 與 Gemini，輸出格式相同。Python 與網頁版都能只設定
+`GEMINI_API_KEY` 自動選 Gemini，不需要 `OPENAI_API_KEY`。
 
 地端版另有桌面程式 [`ocr_app.py`](#地端版-windows-桌面程式)：視窗操作，可打包成 Windows exe，
 模型內附或首次開啟時下載一次，之後完全離線。
@@ -35,12 +35,13 @@ uv sync --extra local --extra bench    # bench_ocr.py
 金鑰放專案根目錄的 `.env`，一行一個 `KEY=VALUE`。非互動 shell 讀不到 `~/.bashrc`，
 所以走 `.env` 比較可靠；已存在的環境變數優先。
 
-```
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
+```dotenv
+GEMINI_API_KEY=...
+# OPENAI_API_KEY=sk-...
+# ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-雲端版只會用到你要跑的那家的金鑰（SDK 是延後 import 的，另一家沒裝也不影響）。
+雲端版只會用到選定 provider 的金鑰（SDK 是延後 import，其他家的套件與金鑰不影響）。
 
 ## 資料夾
 
@@ -60,24 +61,25 @@ bench_out/  各模型的原始輸出（評測用）
 uv run --extra cloud ocr_doc.py                       # input/ 全部 pdf -> output/
 uv run --extra cloud ocr_doc.py input/a.pdf           # 只處理指定檔案
 uv run --extra cloud ocr_doc.py -i in/ -o out/
-uv run --extra cloud ocr_doc.py -p claude             # 改用 Claude（預設 openai）
-uv run --extra cloud ocr_doc.py -m gpt-5-mini         # 換模型
+uv run --extra cloud ocr_doc.py -p gemini             # 明確選 Gemini
+uv run --extra cloud ocr_doc.py -p claude             # 改用 Claude
+uv run --extra cloud ocr_doc.py -m gemini-3.8-flash   # 換模型
 ```
 
-OpenAI 與 Claude 兩家並存，`-p` / `--provider` 選一家。prompt、metadata schema、
-輸出格式完全相同，差別只有 SDK、預設模型與影像解析度上限：
+OpenAI、Claude、Gemini 共用 prompt、metadata schema 與輸出格式。`-p` 可明確選 provider；
+若省略 `-p` 且只設定 `GEMINI_API_KEY`，會自動選 Gemini，其他情況維持 OpenAI 預設。
 
-| | `-p openai`（預設） | `-p claude` |
-| --- | --- | --- |
-| 金鑰 | `OPENAI_API_KEY` | `ANTHROPIC_API_KEY` |
-| 預設模型 | `gpt-5` | `claude-opus-5` |
-| 覆寫模型的環境變數 | `OPENAI_MODEL` | `ANTHROPIC_MODEL` |
-| render | 175 DPI，長邊 ≤ 2048 | 220 DPI，長邊 ≤ 2576 |
+| | `-p openai` | `-p claude` | `-p gemini` |
+| --- | --- | --- | --- |
+| 金鑰 | `OPENAI_API_KEY` | `ANTHROPIC_API_KEY` | `GEMINI_API_KEY` |
+| 預設模型 | `gpt-5` | `claude-opus-5` | `gemini-3.8-flash` |
+| 覆寫模型 | `OPENAI_MODEL` | `ANTHROPIC_MODEL` | `GEMINI_MODEL` |
+| 文件輸入 | 175 DPI，長邊 ≤ 2048 | 220 DPI，長邊 ≤ 2576 | 原生 PDF |
 
-解析度差異是各家視覺輸入上限不同，兩邊都是「把額度用滿又不會被降採樣」的值。
-模型名稱優先序：`-m` > 環境變數 > 內建預設值。
+OpenAI 與 Claude 依各自的視覺輸入上限 render；Gemini 原生接收 PDF，避免多頁 PNG
+膨脹。模型名稱優先序：`-m` > provider 的模型環境變數 > 內建預設值。
 
-兩家的輸出檔名都是 `<檔名>.md`，要並排比較就用 `-o` 分開放。
+三家的輸出檔名都是 `<檔名>.md`，要並排比較就用 `-o` 分開放。
 
 單份上限 20 頁（`MAX_PAGES_PER_REQUEST`）。模型回傳的頁數與輸入頁數不符會直接失敗，
 不會產出頁碼對不上的檔案。

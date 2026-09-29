@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """公文 PDF -> Markdown（含 YAML frontmatter metadata）
 
-用 PyMuPDF 把掃描 PDF 每頁轉成點陣圖，交給視覺模型做 OCR + 版面重建 +
-metadata 抽取，輸出成 .md 檔（開頭是 YAML frontmatter）。
+OpenAI 與 Claude 會把掃描 PDF 每頁轉成點陣圖，再交給視覺模型做 OCR；
+Gemini 直接讀取 PDF。三家都會重建版面、抽 metadata，輸出成 .md 檔
+（開頭是 YAML frontmatter）。
 
-支援兩家雲端模型，用 `--provider` 選；prompt、schema、輸出格式完全一樣，
-差別只在 SDK、預設模型與影像解析度上限（見 PROVIDERS）。
+用 `--provider` 可指定雲端模型；只設定 `GEMINI_API_KEY` 時會自動選 Gemini。
+三家的 prompt、schema 與輸出格式完全相同。
 
 輸出的正文會逐頁插入 `<!-- page: N/總頁數 -->` 標記，方便後續 RAG
 切 chunk 時保留頁碼來源。
 
 用法:
-    export OPENAI_API_KEY=sk-...          # 或 ANTHROPIC_API_KEY，或寫進 .env
+    export GEMINI_API_KEY=...             # 只設定這把 key 即可，或寫進 .env
     python3 ocr_doc.py                    # input/ 底下所有 pdf -> output/
     python3 ocr_doc.py a.pdf b.pdf        # 只處理指定檔案
     python3 ocr_doc.py -i in/ -o out/     # 指定輸入／輸出目錄
-    python3 ocr_doc.py -p claude          # 改用 Claude（預設 openai）
-    python3 ocr_doc.py -m gpt-5-mini      # 換模型
+    python3 ocr_doc.py -p claude          # 明確指定 Claude
+    python3 ocr_doc.py -m gemini-3.8-flash  # 換模型
 """
 
 from __future__ import annotations
@@ -306,19 +307,78 @@ def extract_claude(client: Any, model: str, images: list[bytes]) -> dict:
     return json.loads(text)
 
 
+# --- Gemini ------------------------------------------------------------------
+
+def make_client_gemini() -> Any:
+    from google import genai
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("沒有設定 GEMINI_API_KEY，請設環境變數或寫進 .env")
+    return genai.Client(api_key=api_key)
+
+
+def extract_gemini(client: Any, model: str, pdf: bytes) -> dict:
+    """呼叫 Gemini 原生讀取 PDF，回傳 {'metadata': ..., 'pages': [...]}。"""
+    stream = client.interactions.create(
+        model=model,
+        input=[
+            {
+                "type": "document",
+                "data": base64.standard_b64encode(pdf).decode(),
+                "mime_type": "application/pdf",
+            },
+            {"type": "text", "text": USER_PROMPT},
+        ],
+        system_instruction=SYSTEM_PROMPT,
+        generation_config={
+            "max_output_tokens": 32000,
+            "thinking_level": "high",
+        },
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": SCHEMA,
+        },
+        stream=True,
+        timeout=1800.0,
+    )
+
+    parts: list[str] = []
+    for event in stream:
+        event_type = getattr(event, "event_type", None)
+        if event_type == "error":
+            error = getattr(event, "error", None)
+            detail = (
+                getattr(error, "message", None)
+                or getattr(error, "code", None)
+                or "未知錯誤"
+            )
+            raise RuntimeError(f"Gemini 回應失敗：{detail}")
+        delta = getattr(event, "delta", None)
+        if event_type == "step.delta" and getattr(delta, "type", None) == "text":
+            parts.append(delta.text)
+
+    text = "".join(parts)
+    if not text:
+        raise RuntimeError("Gemini 沒有回傳內容")
+    return json.loads(text)
+
+
 @dataclass(frozen=True)
 class Provider:
-    """一家雲端模型的接法。兩家的 prompt、schema、輸出格式都相同，
-    差別只有這裡列的幾項。"""
+    """一家雲端模型的接法。prompt、schema、輸出格式都相同；
+    render_dpi/max_edge 為 None 時代表模型直接接收 PDF。"""
 
     name: str
     default_model: str
     model_env: str
     # 視覺輸入的解析度上限：超過會被 API 自己縮，等於白花 token。
-    max_edge: int
-    render_dpi: int
+    # Gemini 原生接收 PDF，不需要 render，因此兩者皆為 None。
+    max_edge: int | None
+    render_dpi: int | None
     make_client: Callable[[], Any]
-    extract: Callable[[Any, str, list[bytes]], dict]
+    extract: Callable[[Any, str, Any], dict]
 
 
 PROVIDERS = {
@@ -343,6 +403,15 @@ PROVIDERS = {
         render_dpi=220,
         make_client=make_client_claude,
         extract=extract_claude,
+    ),
+    "gemini": Provider(
+        name="gemini",
+        default_model="gemini-3.8-flash",
+        model_env="GEMINI_MODEL",
+        max_edge=None,
+        render_dpi=None,
+        make_client=make_client_gemini,
+        extract=extract_gemini,
     ),
 }
 
@@ -380,22 +449,38 @@ def to_markdown_file(result: dict, source: Path, pages: int) -> str:
 
 
 def process(provider: Provider, client: Any, model: str, pdf: Path, outdir: Path) -> Path:
-    images = render_pages(pdf, provider.render_dpi, provider.max_edge)
-    if len(images) > MAX_PAGES_PER_REQUEST:
-        raise RuntimeError(
-            f"{pdf.name} 有 {len(images)} 頁，超過單次上限 {MAX_PAGES_PER_REQUEST}"
-        )
-    print(f"  已 render {len(images)} 頁，送出辨識…", flush=True)
+    if provider.render_dpi is None or provider.max_edge is None:
+        document = pdf.read_bytes()
+        with pymupdf.open(stream=document, filetype="pdf") as doc:
+            total = doc.page_count
+        prepared = "讀取"
+    else:
+        document = render_pages(pdf, provider.render_dpi, provider.max_edge)
+        total = len(document)
+        prepared = "render"
 
-    result = provider.extract(client, model, images)
+    if total > MAX_PAGES_PER_REQUEST:
+        raise RuntimeError(
+            f"{pdf.name} 有 {total} 頁，超過單次上限 {MAX_PAGES_PER_REQUEST}"
+        )
+    print(f"  已{prepared} {total} 頁，送出辨識…", flush=True)
+
+    result = provider.extract(client, model, document)
     got = len(result["pages"])
-    if got != len(images):
+    if got != total:
         # 頁碼標記是給 RAG 溯源用的，對不上就等於引用錯頁，寧可讓它爆掉。
-        raise RuntimeError(f"模型回了 {got} 頁，與輸入的 {len(images)} 頁不符")
+        raise RuntimeError(f"模型回了 {got} 頁，與輸入的 {total} 頁不符")
 
     out = outdir / (pdf.stem + ".md")
-    out.write_text(to_markdown_file(result, pdf, len(images)), encoding="utf-8")
+    out.write_text(to_markdown_file(result, pdf, total), encoding="utf-8")
     return out
+
+
+def choose_default_provider() -> str:
+    """只有 Gemini key 時自動選 Gemini；其餘維持既有的 OpenAI 預設。"""
+    if not os.environ.get("OPENAI_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
+    return DEFAULT_PROVIDER
 
 
 def main() -> int:
@@ -405,8 +490,8 @@ def main() -> int:
                     help=f"輸入目錄（預設：{DEFAULT_INDIR}/）")
     ap.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR,
                     help=f"輸出目錄（預設：{DEFAULT_OUTDIR}/）")
-    ap.add_argument("-p", "--provider", choices=sorted(PROVIDERS), default=DEFAULT_PROVIDER,
-                    help=f"用哪家模型（預設：{DEFAULT_PROVIDER}）")
+    ap.add_argument("-p", "--provider", choices=sorted(PROVIDERS), default=None,
+                    help="用哪家模型（預設：openai；只有 Gemini key 時自動選 gemini）")
     ap.add_argument("-m", "--model", default=None,
                     help="模型名稱（預設：各 provider 的 $..._MODEL 或內建預設值）")
     args = ap.parse_args()
@@ -420,7 +505,7 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     load_dotenv()
-    provider = PROVIDERS[args.provider]
+    provider = PROVIDERS[args.provider or choose_default_provider()]
     model = args.model or os.environ.get(provider.model_env) or provider.default_model
     client = provider.make_client()
     print(f"provider={provider.name} model={model}")
