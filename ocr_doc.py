@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import pymupdf
 import yaml
 
 # 輸入 PDF 與輸出 Markdown 各自有固定資料夾，不再散在當前目錄。
@@ -185,6 +184,9 @@ SCHEMA = {
 
 def render_pages(pdf_path: Path, dpi: int, max_edge: int) -> list[bytes]:
     """把 PDF 每頁 render 成 PNG bytes，長邊不超過 max_edge。"""
+    # 延後 import：地端版與其 exe 會 import 本模組取共用常數，但不安裝 AGPL 的 PyMuPDF。
+    import pymupdf
+
     images = []
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
@@ -450,6 +452,8 @@ def to_markdown_file(result: dict, source: Path, pages: int) -> str:
 
 def process(provider: Provider, client: Any, model: str, pdf: Path, outdir: Path) -> Path:
     if provider.render_dpi is None or provider.max_edge is None:
+        import pymupdf
+
         document = pdf.read_bytes()
         with pymupdf.open(stream=document, filetype="pdf") as doc:
             total = doc.page_count

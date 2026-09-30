@@ -330,6 +330,19 @@ fallback 直接用它。
    設 `HF_HUB_OFFLINE=1` 並固定 cache 位置，只有下載子程序會連網；取消就是結束子程序。
    完成的檔案會保留，未完成的大檔不保證續傳。manifest 只列執行必需檔與授權檔。
 4. **Tk，不用網頁或 Qt**：Python 內建、PyInstaller 直接支援，不多一層伺服器或 3xx MB 的 Qt。
+5. **exe 的授權要能公開散布**：PyMuPDF 是 AGPL-3.0（或 Artifex 商業授權），與隨 PyTorch 打包的
+   NVIDIA CUDA/cuDNN 授權（不得使 SDK 受要求公開原始碼的開源授權約束）放在同一個 exe 有衝突。
+   地端版改用 pypdfium2（Apache-2.0／BSD-3-Clause）render。82 頁的圖尺寸完全相同、平均像素差
+   < 0.5/255，但**OCR 結果會變**：50 份樣本中 23 份與 PyMuPDF 版逐字相同、27 份有差（這 27 份
+   平均相似度 99.13%，最低 93.14%）；PyMuPDF 重跑 27/27 逐字相同，差異確實來自 render。
+   差異是單字辨識翻轉與個別表格／純文字排版不同，方向不一（例：「選場」→「還場」較合理，
+   「檔號」→「橘號」則變錯）。沒有 ground truth；唯一可驗證的欄位「發文字號 == 檔名」
+   PyMuPDF 48/50、pypdfium2 49/50。這是為了授權接受的行為變更。雲端版仍用 PyMuPDF
+   （延後 import，只在 `cloud` extra）；`output/` 仍是 PyMuPDF 版的結果。
+   `windows/third_party_licenses.py` 依 PyInstaller 實際打包的檔案產生授權清單並附原文，遇到
+   GPL/AGPL 套件或不在 NVIDIA 可散布清單的 DLL 就讓建置失敗——這只是防呆，不取代逐項審核。
+   `cusolverMg`、`nvperf_host` 不在清單內、沒有 DLL 靜態連結，排除後實際 CUDA OCR 正常，spec
+   直接排除。授權原文固定存在 `windows/licenses/`，建置不連網下載。本專案自有程式碼採 MIT。
 
 ---
 

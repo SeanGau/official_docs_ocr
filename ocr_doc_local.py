@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 
-import pymupdf
+import pypdfium2 as pdfium
 import torch
 import yaml
 from PIL import Image
@@ -85,17 +85,24 @@ def render_pages(
     max_width: int,
     max_height: int,
 ) -> list[bytes]:
-    """把 PDF 每頁 render 成 PNG bytes，符合 Nemotron 的輸入尺寸上限。"""
+    """把 PDF 每頁 render 成 PNG bytes，符合 Nemotron 的輸入尺寸上限。
+
+    用 pypdfium2（Apache-2.0／BSD-3-Clause），不用 AGPL 的 PyMuPDF，讓地端版的 exe 可以
+    寬鬆授權散布。表單欄位與註解照樣畫出，與先前 PyMuPDF 的 render 尺寸一致。
+    """
     images = []
-    with pymupdf.open(pdf_path) as doc:
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        doc.init_forms()
         for page in doc:
-            scale = min(
-                dpi / 72,
-                max_width / page.rect.width,
-                max_height / page.rect.height,
-            )
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
-            images.append(pix.tobytes("png"))
+            width, height = page.get_size()
+            scale = min(dpi / 72, max_width / width, max_height / height)
+            buffer = BytesIO()
+            page.render(scale=scale).to_pil().save(buffer, format="PNG")
+            images.append(buffer.getvalue())
+            page.close()
+    finally:
+        doc.close()
     return images
 
 

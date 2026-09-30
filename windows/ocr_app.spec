@@ -6,6 +6,7 @@
 # 環境變數 OCR_DOC_HF_HUB 指向 model_store.py stage 整理好的 hub cache 時，打包進
 # _internal\hf_hub（完全離線版）；未設定則不附模型，程式開啟時會提示下載。
 import os
+import re
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
@@ -43,8 +44,13 @@ a = Analysis(
         "open_clip": "pyz+py",
         "transformers": "pyz+py",
     },
-    excludes=["anthropic", "openai", "google.genai"],
+    # 雲端 SDK 用不到；PyMuPDF 是 AGPL，地端版改用 pypdfium2，不得打包進來。
+    excludes=["anthropic", "openai", "google.genai", "pymupdf", "fitz"],
 )
+# 這兩個 NVIDIA DLL 不在 CUDA EULA Attachment A 的可散布清單，也沒有其他 DLL 連結它們
+# （cuSOLVER 多 GPU 版、Nsight Perf 效能計數），不打包；third_party_licenses.py 會再檢查一次。
+NOT_REDISTRIBUTABLE = re.compile(r"(^|[\\/])(cusolverMg64_\d+|nvperf_host)\.dll$", re.I)
+a.binaries = [entry for entry in a.binaries if not NOT_REDISTRIBUTABLE.search(entry[0])]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

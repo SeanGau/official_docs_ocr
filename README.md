@@ -150,8 +150,11 @@ powershell -ExecutionPolicy Bypass -File windows\build.ps1 -NoModel   # 不附�
   要整包複製或壓縮；單拿 `OfficialDocOCR.exe` 無法執行。
 - 內附版的模型在建置時由 `python model_store.py stage` 依 manifest 下載，整理成不含 symlink
   的 Hugging Face cache 放進 `_internal\hf_hub`，搬到別台電腦也能用。
-- 成品根目錄有 `NOTICE.txt` 與 `NVIDIA-Open-Model-License.pdf`（C-RADIOv2-H 的 NVIDIA Open
-  Model License §3.1 要求），Nemotron 的 `LICENSE` 在模型 snapshot 裡。複製時一起帶走。
+- 成品根目錄有 `LICENSE`（本專案 MIT）、`THIRD_PARTY_LICENSES.txt`（建置時依實際打包的檔案產生，
+  含 Python 套件、NVIDIA CUDA/cuDNN runtime、Python、Tcl/Tk、MSVC runtime、PyInstaller）、
+  `NOTICE.txt` 與 `NVIDIA-Open-Model-License.pdf`（模型授權），Nemotron 的 `LICENSE` 在模型
+  snapshot 裡。複製時一起帶走。打包到 GPL/AGPL 套件或不可散布的 NVIDIA DLL 時建置會失敗；
+  因此地端版用 pypdfium2 render PDF，不用 AGPL 的 PyMuPDF。
 - Windows 的 torch 由 `pyproject.toml` 指定從 PyTorch 的 CUDA 13.0 index 安裝：
   需要 Turing（RTX 20 系列）以後的 NVIDIA GPU 與 R580 以上的驅動；沒有 GPU 就退回 CPU，
   但一頁要十幾分鐘、記憶體約 6.5 GB。
@@ -210,3 +213,13 @@ uv run --extra local --extra bench bench_ocr.py
 
 雲端版的產出只是**參照**不是 ground truth，它本身也可能有錯；相似度低不必然代表
 地端模型錯，但差距很大時通常是。
+
+## 授權
+
+本專案**自有的程式碼**以 [MIT](LICENSE) 授權；第三方套件與模型不在此列，各依其授權：
+
+- 雲端版使用的 PyMuPDF、`web/` 使用的 MuPDF.js 都是 AGPL-3.0（或 Artifex 商業授權）。
+  `web/` 若公開部署成網路服務，AGPL 另要求向使用者提供該運行版本的原始碼，目前介面尚未提供，
+  部署前需自行處理。地端版與 Windows exe 不含 MuPDF。
+- Windows exe 隨附元件的授權見成品內的 `THIRD_PARTY_LICENSES.txt`；模型授權見
+  [`windows/NOTICE.txt`](windows/NOTICE.txt)。

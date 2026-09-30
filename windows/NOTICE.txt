@@ -1,4 +1,5 @@
 OfficialDocOCR 使用的第三方模型檔案
+（程式本身為 MIT 授權，見 LICENSE；其餘隨附的軟體元件見 THIRD_PARTY_LICENSES.txt）
 （內附版放在 _internal\hf_hub；未內附時由程式下載到使用者的 Hugging Face cache，
  預設 %USERPROFILE%\.cache\huggingface\hub）
 
