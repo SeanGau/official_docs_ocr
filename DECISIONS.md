@@ -322,8 +322,10 @@ fallback 直接用它。
 1. **模型版本鎖在 `model_manifest.json`**：Nemotron 與它以 remote code 引用的 C-RADIOv2-H
    都固定 commit，並記下每個檔案大小。開啟時只比對本機檔案大小與 `refs/main`，完全不連網；
    也避免 `trust_remote_code` 在使用者端默默抓到新版程式碼。
-2. **找模型的順序**：exe 內附 → `%LOCALAPPDATA%\OfficialDocParser\hf_hub` → 使用者既有的
-   HF cache。預設建置內附模型（完全離線）；`-NoModel` 版首次開啟顯示缺多少、按鈕下載。
+2. **找模型的順序**：exe 內附 → 使用者的 Hugging Face cache；缺檔時也下載到這個 cache。
+   與其他 HF 工具共用、不重複下載 3.4 GB，也讓「顯示的位置」就是「下載的位置」。
+   代價是 cache 的 `refs/main` 會被設成固定 commit。預設建置內附模型（完全離線）；
+   `-NoModel` 版首次開啟顯示缺多少、按鈕下載。
 3. **下載放子程序**：huggingface_hub 在 import 時就讀 `HF_HUB_OFFLINE`。GUI 程序在載入模型前
    設 `HF_HUB_OFFLINE=1` 並固定 cache 位置，只有下載子程序會連網；取消就是結束子程序。
    完成的檔案會保留，未完成的大檔不保證續傳。manifest 只列執行必需檔與授權檔。

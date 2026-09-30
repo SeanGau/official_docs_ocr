@@ -67,26 +67,27 @@ def app_data_dir() -> Path:
 
 
 def download_store() -> Path:
-    """程式自行下載模型的位置（使用者可寫）。"""
-    return app_data_dir() / "hf_hub"
+    """下載與讀取模型的 Hugging Face hub cache，規則與 huggingface_hub 相同：
+    HF_HUB_CACHE（或舊名 HUGGINGFACE_HUB_CACHE）> HF_HOME/hub > ~/.cache/huggingface/hub。
 
-
-def default_hf_cache() -> Path:
-    """使用者既有的 Hugging Face hub cache；與 huggingface_hub 的預設規則相同。"""
-    if os.environ.get("HF_HUB_CACHE"):
-        return Path(os.environ["HF_HUB_CACHE"])
+    與其他 Hugging Face 工具共用，已下載過就不必重下。不 import huggingface_hub 來算：
+    它在 import 時就讀 HF_HUB_OFFLINE，GUI 程序得等載入模型前才設定。
+    """
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(name):
+            return Path(os.environ[name]).expanduser()
     hf_home = os.environ.get("HF_HOME") or Path(
         os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
     ) / "huggingface"
-    return Path(hf_home) / "hub"
+    return Path(hf_home).expanduser() / "hub"
 
 
 def candidate_stores() -> list[Path]:
-    """依序檢查：exe 內附 → 程式下載區 → 使用者既有的 HF cache。"""
+    """依序檢查：exe 內附（唯讀）→ 使用者的 Hugging Face cache（也是下載位置）。"""
     stores = []
     if getattr(sys, "frozen", False):
         stores.append(Path(sys._MEIPASS) / "hf_hub")
-    stores += [download_store(), default_hf_cache()]
+    stores.append(download_store())
     return stores
 
 

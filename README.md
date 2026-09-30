@@ -123,12 +123,15 @@ uv run --extra local ocr_app.py input/a.pdf     # 開啟時先加入檔案或資
 
 **開啟時的離線檢查**：模型版本固定在 `model_manifest.json`（repo、commit、每個檔案大小）。
 程式開啟時只比對本機檔案，不連網，依序找：exe 內附的 `_internal\hf_hub` →
-`%LOCALAPPDATA%\OfficialDocParser\hf_hub` → 使用者既有的 Hugging Face cache。
+使用者的 Hugging Face cache（`HF_HUB_CACHE` > `HF_HOME\hub` > `%USERPROFILE%\.cache\huggingface\hub`，
+規則與 huggingface_hub 相同）。
 
 - 找到完整的一份：顯示「離線資源完整，不需要網路」，之後全程離線（`HF_HUB_OFFLINE=1`）。
-- 都不完整：顯示缺幾個檔、需要下載多少，按「下載模型」後在子程序下載到
-  `%LOCALAPPDATA%\OfficialDocParser\hf_hub`，顯示進度、速度與估計剩餘時間，可取消；
-  完成的檔案會保留，下次只下載缺少的部分。
+- 都不完整：顯示缺幾個檔、需要下載多少，按「下載模型」後在子程序下載到上面那個
+  Hugging Face cache（與其他 Hugging Face 工具共用，已有的檔案不重下），顯示進度、速度與
+  估計剩餘時間，可取消；完成的檔案會保留，下次只下載缺少的部分。
+- 下載完會把兩個 repo 的 `refs/main` 設成 manifest 固定的 commit（離線載入 remote code
+  要靠它）；同一個 cache 若被其他工具更新到新版 `main`，下次開啟會被判定需要補下載。
 
 程式紀錄（含錯誤的完整 traceback）寫在 `%LOCALAPPDATA%\OfficialDocParser\app.log`。
 

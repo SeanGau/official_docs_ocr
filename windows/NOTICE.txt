@@ -1,5 +1,6 @@
 OfficialDocOCR 使用的第三方模型檔案
-（內附版放在 _internal\hf_hub；未內附時由程式下載到 %LOCALAPPDATA%\OfficialDocParser\hf_hub）
+（內附版放在 _internal\hf_hub；未內附時由程式下載到使用者的 Hugging Face cache，
+ 預設 %USERPROFILE%\.cache\huggingface\hub）
 
 1. NVIDIA Nemotron-Parse 2.0（權重、設定、tokenizer 與 remote code）
    來源：https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-2.0
