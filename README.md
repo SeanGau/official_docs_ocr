@@ -13,9 +13,10 @@
 | metadata | 18 個欄位，與正文同一次結構化輸出 | 從第 1 頁 OCR 文字的固定標籤抽取 |
 | 輸出檔名 | `<檔名>.md` | `<檔名>.local.md` |
 
-另有 [`web/`](web/)：雲端版的 JavaScript 網頁服務（拖 PDF、看進度、下載 `.md`），
-支援 OpenAI 與 Gemini，輸出格式相同。Python 與網頁版都能只設定
-`GEMINI_API_KEY` 自動選 Gemini，不需要 `OPENAI_API_KEY`。
+另有 [`web/`](web/)：雲端版的純靜態網頁（HTML + JavaScript + CSS），可直接部署到
+GitHub Pages。使用者在瀏覽器填入自己的 OpenAI、Claude 或 Gemini API key，拖 PDF、
+看進度、下載 `.md`，輸出格式相同。Python 版只設定 `GEMINI_API_KEY` 時會自動選 Gemini，
+不需要 `OPENAI_API_KEY`。
 
 地端版另有桌面程式 [`ocr_app.py`](#地端版-windows-桌面程式)：視窗操作，可打包成 Windows exe，
 模型內附或首次開啟時下載一次，之後完全離線。
@@ -218,8 +219,7 @@ uv run --extra local --extra bench bench_ocr.py
 
 本專案**自有的程式碼**以 [MIT](LICENSE) 授權；第三方套件與模型不在此列，各依其授權：
 
-- 雲端版使用的 PyMuPDF、`web/` 使用的 MuPDF.js 都是 AGPL-3.0（或 Artifex 商業授權）。
-  `web/` 若公開部署成網路服務，AGPL 另要求向使用者提供該運行版本的原始碼，目前介面尚未提供，
-  部署前需自行處理。地端版與 Windows exe 不含 MuPDF。
+- 雲端版使用的 PyMuPDF 是 AGPL-3.0（或 Artifex 商業授權）。地端版、Windows exe 與 `web/`
+  都不含 MuPDF；`web/` 用 pdf.js（Apache-2.0）與 yaml（ISC），授權原文在 `web/vendor/`。
 - Windows exe 隨附元件的授權見成品內的 `THIRD_PARTY_LICENSES.txt`；模型授權見
   [`windows/NOTICE.txt`](windows/NOTICE.txt)。

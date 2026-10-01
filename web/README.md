@@ -1,80 +1,64 @@
-# 公文 PDF → Markdown 網頁服務
+# 公文 PDF → Markdown 網頁版（GitHub Pages）
 
-`../ocr_doc.py` 的 JavaScript 版，包成一個單頁網站：把 PDF 拖進瀏覽器，
-看著進度跑完，下載 `.md`。
+`../ocr_doc.py` 雲端版的 JavaScript 移植，整個是純靜態網頁（HTML + JavaScript + CSS），
+沒有伺服器端程式。使用者在頁面填入自己的 OpenAI、Claude 或 Gemini API key，
+把 PDF 拖進瀏覽器，看著進度跑完，下載 `.md`。
 
-OpenAI 與 Gemini 共用同一套 prompt、18 欄 metadata schema、頁碼標記、20 頁上限
-與頁數檢查，產出的 `.md` 格式相同。OpenAI 會把每頁 render 成 PNG；Gemini 使用
-原生 PDF 文件理解，避免多頁 PNG 膨脹。CLI 掃資料夾批次跑，這裡則一次一份、
-結果直接下載，不寫進 `output/`。
+三家共用同一套 prompt、18 欄 metadata schema、頁碼標記、20 頁上限與頁數檢查，
+產出的 `.md` 與 `ocr_doc.py` 格式相同：
 
-`ocr_doc.py` 支援相同的 OpenAI、Gemini，另外也支援 Claude。
+| 供應商 | 預設模型 | 送件方式 |
+| --- | --- | --- |
+| OpenAI | `gpt-5` | 每頁 render 成 PNG（長邊 ≤ 2048px，175 DPI） |
+| Claude | `claude-opus-5` | 每頁 render 成 PNG（長邊 ≤ 2576px，220 DPI） |
+| Gemini | `gemini-3.8-flash` | 原生讀取整份 PDF，不 render |
 
-## 安裝
+模型欄可以改成其他模型名稱。一次轉一份，結果直接下載，不寫進 `output/`。
 
-需要 Node.js 20 以上（開發時用 24.15）。
+## 金鑰與隱私
+
+- 金鑰只留在分頁記憶體，不寫進任何儲存空間，重新整理後要重填。
+  只有供應商與模型的選擇會記在 `localStorage`（不含機密）。
+- PDF 與金鑰由瀏覽器直接送往 `api.openai.com`、`api.anthropic.com` 或
+  `generativelanguage.googleapis.com`。沒有自建後端，但文件與金鑰仍會送到該供應商。
+- 頁面用 `<meta>` CSP 限制：只執行本站腳本，連線只放行上面三個 API 網域與本站資源。
+  GitHub Pages 無法設定 HTTP 標頭，`<meta>` CSP 的防護範圍比標頭版小（例如不支援
+  `frame-ancestors`）。第三方程式庫全部放在 `vendor/`，不從 CDN 載入。
+- 金鑰在瀏覽器裡，任何能在這個頁面執行腳本的東西（例如瀏覽器擴充功能）都讀得到。
+  建議為這個工具另開一把 key，並在供應商後台設定用量上限。
+- 被 API 拒絕的請求若回應沒帶 CORS 標頭（實測 OpenAI 的 401 就沒有），瀏覽器只能顯示
+  「Failed to fetch」，與斷線、被擴充功能攔截無法區分；Claude 與 Gemini 的 401/400
+  實測可讀到 API 回傳的錯誤訊息。
+
+## 部署到 GitHub Pages
+
+`.github/workflows/pages.yml` 會在 `main` 分支的 `web/` 有變動時，把 `web/` 原封不動部署
+（沒有建置步驟）。第一次使用前到 repo 的 **Settings → Pages → Build and deployment → Source**
+選「GitHub Actions」，之後 push 或在 Actions 頁手動執行 workflow 即可。
+
+## 本機執行
+
+ES module 與 pdf.js worker 不能從 `file://` 載入，需要任一靜態伺服器：
 
 ```bash
-cd web
-npm install
-```
-
-四個依賴：`mupdf`（WASM 版 MuPDF，PDF 讀取與 OpenAI 路徑的 render）、
-`openai`、`@google/genai`、`yaml`。瀏覽器只負責上傳，金鑰不會送到前端。
-
-## 啟動
-
-金鑰讀取順序：環境變數 → `web/.env` → 專案根目錄 `.env`（已存在的環境變數優先，
-與 `ocr_doc.py` 的 `load_dotenv` 一致）。
-
-```bash
-GEMINI_API_KEY=... npm start         # 只設這一把 key 即可，不需要 OpenAI key
-OPENAI_API_KEY=sk-... npm start      # 也可只使用 OpenAI
+python3 -m http.server 8787 -d web
 ```
 
 打開 http://localhost:8787 。
 
-環境變數：
+## 檔案
 
-| 變數 | 預設 | 說明 |
-| --- | --- | --- |
-| `GEMINI_API_KEY` | 選 Gemini 時必填 | 只設定這把 key 時會自動選 Gemini |
-| `OPENAI_API_KEY` | 選 OpenAI 時必填 | 不使用 OpenAI 就不需要設定 |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini 的預設模型 |
-| `OPENAI_MODEL` | `gpt-5` | OpenAI 的預設模型 |
-| `OCR_PROVIDER` | 自動 | 可指定 `gemini` 或 `openai`；未指定時，只有 Gemini key 就選 Gemini，其他情況維持 OpenAI |
-| `PORT` | `8787` | |
+| 檔案 | 內容 |
+| --- | --- |
+| `index.html`、`style.css` | 頁面 |
+| `app.js` | 介面：供應商／模型／金鑰設定、拖放、進度、下載 |
+| `ocr.js` | 讀 PDF、render、呼叫三家 API（streaming）、組 Markdown |
+| `vendor/pdfjs/` | [pdf.js](https://github.com/mozilla/pdf.js) `pdfjs-dist@6.3.289`（Apache-2.0）：`build/` 的 `pdf.min.mjs`、`pdf.worker.min.mjs`，以及 `cmaps/`、`standard_fonts/`、`iccs/`、`wasm/`（不含 `quickjs-eval`） |
+| `vendor/yaml/` | [yaml](https://github.com/eemeli/yaml) `yaml@2.9.1`（ISC）的 `browser/` 目錄 |
 
-頁面可切換供應商與臨時覆寫模型。選到沒有對應 key 的供應商時，轉檔會顯示缺少哪個環境變數。
+更新 vendor：`npm pack pdfjs-dist@<版本> yaml@<版本>`，解開後照上表複製對應檔案與 LICENSE。
 
-## API
+## 為什麼用 streaming
 
-也可以不透過頁面直接打：
-
-```bash
-curl -N -X POST "http://localhost:8787/api/convert?name=doc.pdf&provider=gemini" \
-     --data-binary @input/doc.pdf
-```
-
-- `POST /api/convert?name=<檔名>[&provider=openai|gemini][&model=<模型>]`
-  body 直接是 PDF 原始 bytes（不走 multipart），回應是 SSE。省略 `provider` 時使用
-  `/api/config` 回傳的預設供應商：
-
-  | 事件 | 內容 |
-  | --- | --- |
-  | `status` | `{msg}` 目前階段 |
-  | `progress` | `{chars}` 模型已輸出的字元數 |
-  | `done` | `{filename, markdown}` |
-  | `error` | `{msg}` |
-
-- `GET /api/config` → `{provider, model, providers, maxPages, maxUploadMB}`
-
-上限：單份 20 頁（超過直接失敗，不靜默分批）、上傳 50MB。
-模型回傳的頁數與輸入頁數不符會失敗，不會產出頁碼對不上的檔案。
-
-## 為什麼是 SSE
-
-單份公文用 high effort 推理跑好幾分鐘，一個沉默的 POST 看起來像當掉。
-伺服器把文件讀取完成、模型輸出字數即時推給前端，並每 15 秒送一次心跳
-避免中介 proxy 掐斷閒置連線；Node 的 `requestTimeout` 也關掉了
-（預設 5 分鐘會在辨識中途砍掉連線）。
+單份公文用 high effort 推理跑好幾分鐘。三家 API 都以 SSE 串流回應，頁面即時顯示
+模型已輸出的字數，看得出還在跑；瀏覽器的 `fetch` 本身沒有逾時，長時間辨識不會被切斷。

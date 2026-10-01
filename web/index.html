@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 頁面握有使用者的 API key：只允許本站腳本，連線只放行三家 API 與本站資源。 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; style-src 'self'; font-src 'self' data:; img-src 'self' data: blob:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>公文 PDF → Markdown</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<main>
+  <h1>公文 PDF → Markdown</h1>
+  <p class="sub">掃描的台灣公文轉成帶 YAML frontmatter 的 Markdown，正文逐頁標記頁碼。</p>
+
+  <div class="card">
+    <div class="row first">
+      <label for="provider">供應商</label>
+      <select id="provider"></select>
+      <label for="model">模型</label>
+      <input type="text" id="model" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="row">
+      <label for="key">API key</label>
+      <input type="password" id="key" spellcheck="false" autocomplete="off">
+    </div>
+    <p class="note">
+      金鑰只留在這個分頁的記憶體，不會存檔，重新整理後要重填。
+      轉檔時 PDF 與金鑰由瀏覽器直接送往該供應商的 API，不經過本站或其他自建伺服器。
+      <a id="keyurl" target="_blank" rel="noopener noreferrer">取得 API key</a>
+    </p>
+  </div>
+
+  <div class="card">
+    <div id="drop">
+      <strong>把 PDF 拖到這裡</strong>
+      <span id="hint">或點一下選擇檔案</span>
+    </div>
+    <input type="file" id="file" accept="application/pdf,.pdf" hidden>
+    <div class="row end">
+      <button id="go" disabled>開始轉換</button>
+    </div>
+  </div>
+
+  <div class="card" id="status">
+    <div id="msg">準備中…</div>
+    <div class="bar"><i></i></div>
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <div class="card" id="result">
+    <div class="row first spread">
+      <strong id="outname"></strong>
+      <span>
+        <button class="ghost" id="copy">複製</button>
+        <button id="download">下載 .md</button>
+      </span>
+    </div>
+    <pre id="out"></pre>
+  </div>
+</main>
+</body>
+</html>

@@ -346,6 +346,32 @@ fallback 直接用它。
 
 ---
 
+## 八、`web/` 改成 GitHub Pages 純靜態網頁
+
+1. **拿掉 Node 伺服器，瀏覽器直接打 API**：使用者自己填 key，就不需要伺服器保管金鑰，
+   也就能放上 GitHub Pages。三家 API 的 CORS preflight 都放行（Anthropic 另需
+   `anthropic-dangerous-direct-browser-access: true`）。實測金鑰錯誤時，Anthropic、Gemini 的
+   錯誤回應帶 CORS 標頭、瀏覽器讀得到原因；OpenAI 的 401 沒帶，見第 6 點。舊的 `server.mjs`、
+   `/api/*` 與 `npm` 依賴整個移除，不留兩套。
+2. **不用 SDK，直接 `fetch` + 自己解析 SSE**：請求內容與 `ocr_doc.py` 經 SDK 送出的相同
+   （OpenAI Responses、Claude Messages、Gemini Interactions `v1beta/interactions`），
+   省掉打包步驟與幾 MB 的 SDK。補上 Claude，三家與 Python 版對齊。Gemini 的 endpoint 是
+   `v1beta`，之後若改版，靜態版會直接壞，先查這裡。
+3. **pdf.js 取代 MuPDF.js**：MuPDF 是 AGPL，公開部署要另外提供原始碼；pdf.js 是 Apache-2.0。
+   換 render 器可能改變 OCR 結果（§七第 5 點換 pypdfium2 時就有差異），pdf.js 與 MuPDF 之間
+   **沒有做過比對**。尺寸規則不變（OpenAI 175 DPI／長邊 2048，Claude 220 DPI／長邊 2576，
+   Gemini 原生 PDF）。
+4. **第三方程式庫放 `web/vendor/`，不走 CDN**：頁面握有使用者的 key，CDN 被換掉就能偷 key。
+   搭配 `<meta>` CSP：只允許本站腳本，`connect-src` 只放行三個 API 網域。
+5. **金鑰只在分頁記憶體**，不提供「記住金鑰」：需求只要求填 key 就能用，存進 `localStorage`
+   會擴大外洩面。供應商與模型偏好不含機密，會記住。
+6. **已知限制**：實測 OpenAI 對錯誤金鑰回的 401 不帶 CORS 標頭，瀏覽器只看得到 `Failed to fetch`，
+   與斷線無法區分，錯誤訊息只能通用地提示檢查網路與金鑰。
+7. **不在前端預設檔案大小上限**：各家 request 大小上限不同且會調整，寫死數字可能擋掉合法檔案；
+   超過時由 API 拒絕請求（若錯誤回應沒帶 CORS 標頭，頁面只會顯示連線失敗）。
+
+---
+
 ## 貫穿全程的幾條原則
 
 1. **失敗要吵，不要安靜**。頁數不符報錯、超過 20 頁報錯、截斷報錯並說出 thinking 用掉多少。
