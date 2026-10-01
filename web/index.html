@@ -19,13 +19,15 @@
     <div class="row first">
       <label for="provider">供應商</label>
       <select id="provider"></select>
-      <label for="model">模型</label>
-      <input type="text" id="model" spellcheck="false" autocomplete="off">
-    </div>
-    <div class="row">
       <label for="key">API key</label>
       <input type="password" id="key" spellcheck="false" autocomplete="off">
     </div>
+    <div class="row">
+      <label for="model">模型</label>
+      <select id="model"></select>
+      <input type="text" id="custommodel" spellcheck="false" autocomplete="off" placeholder="輸入模型名稱後按 Enter" aria-label="自訂模型名稱" hidden>
+    </div>
+    <p class="note" id="modelnote" role="status" aria-live="polite"></p>
     <p class="note">
       金鑰只留在這個分頁的記憶體，不會存檔，重新整理後要重填。
       轉檔時 PDF 與金鑰由瀏覽器直接送往該供應商的 API，不經過本站或其他自建伺服器。

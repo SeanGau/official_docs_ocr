@@ -13,7 +13,19 @@
 | Claude | `claude-opus-5` | 每頁 render 成 PNG（長邊 ≤ 2576px，220 DPI） |
 | Gemini | `gemini-3.8-flash` | 原生讀取整份 PDF，不 render |
 
-模型欄可以改成其他模型名稱。一次轉一份，結果直接下載，不寫進 `output/`。
+填入 API key 後（按 Enter 或離開欄位），頁面會用這把 key 呼叫供應商的模型清單 API
+（只送 key，不送 PDF），模型欄改成下拉選單，列出候選模型：
+
+| 供應商 | 清單來源 | 篩選 |
+| --- | --- | --- |
+| OpenAI | `GET /v1/models` | 清單沒有能力欄位，只能看名稱：GPT-5 以後與 o 系列推理模型，排除語音、即時、影像生成、搜尋、codex、chat 等專用型號 |
+| Claude | `GET /v1/models` | 依 API 回報的能力：影像輸入、結構化輸出、effort high、adaptive thinking 四項都明確支援才列入 |
+| Gemini | `GET /v1beta/models` | `gemini-*`、支援 `generateContent`、未標示不支援 thinking，排除 tts／image／embedding／audio／live |
+
+只有 Claude 是依能力精確篩選；OpenAI、Gemini 的清單無法證明與本工具的請求相容，
+選到不相容的模型時，轉檔會由 API 回錯。查不到清單（金鑰錯、網路、CORS）時會顯示原因，
+仍可選「其他（自行輸入）」填任意模型名稱。
+清單只在記憶體裡，依供應商與金鑰快取。一次轉一份，結果直接下載，不寫進 `output/`。
 
 ## 金鑰與隱私
 

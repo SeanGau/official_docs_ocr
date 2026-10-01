@@ -369,6 +369,12 @@ fallback 直接用它。
    與斷線無法區分，錯誤訊息只能通用地提示檢查網路與金鑰。
 7. **不在前端預設檔案大小上限**：各家 request 大小上限不同且會調整，寫死數字可能擋掉合法檔案；
    超過時由 API 拒絕請求（若錯誤回應沒帶 CORS 標頭，頁面只會顯示連線失敗）。
+8. **模型清單用使用者的 key 向 API 查**，下拉選單列候選模型，另留「其他」自行輸入。
+   篩選依據各家能提供的資訊：只有 Claude 的 `/v1/models` 回報 capabilities，可精確篩出影像、
+   結構化輸出、effort high 與 adaptive thinking 四項都明確支援的模型（實測 13 個中排除 3 個；
+   沒附 capabilities 的不列入）。Gemini 的 `supportedGenerationMethods`／`thinking` 不能證明
+   Interactions 相容；OpenAI 只有 ID，只能用名稱規則，新型號命名改變時可能漏列。這兩家的
+   清單只是候選，能否使用以轉檔時 API 的回應為準。
 
 ---
 

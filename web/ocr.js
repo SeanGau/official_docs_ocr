@@ -209,17 +209,11 @@ async function* readSse(res) {
   }
 }
 
-/**
- * POST 一個 streaming 請求；HTTP 錯誤時把 API 回的錯誤訊息帶出來。
- */
-async function postStream(label, url, headers, body) {
+/** 送出請求；連不上或 HTTP 錯誤時把 API 回的錯誤訊息帶出來。 */
+async function apiFetch(label, url, init) {
   let res;
   try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "text/event-stream", ...headers },
-      body: JSON.stringify(body),
-    });
+    res = await fetch(url, init);
   } catch (e) {
     // 錯誤回應若沒帶 CORS 標頭，瀏覽器只給 "Failed to fetch"，分不出是斷線、被擋或請求被拒。
     throw new Error(`連不到 ${label} API：${e.message}。請確認網路連線與 API key`);
@@ -237,6 +231,98 @@ async function postStream(label, url, headers, body) {
     throw new Error(`${label} API 回應 ${res.status}：${msg || res.statusText}`);
   }
   return res;
+}
+
+function postStream(label, url, headers, body) {
+  return apiFetch(label, url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+async function getJson(label, url, headers) {
+  return (await apiFetch(label, url, { headers })).json();
+}
+
+const openaiHeaders = (apiKey) => ({ authorization: `Bearer ${apiKey}` });
+const claudeHeaders = (apiKey) => ({
+  "x-api-key": apiKey,
+  "anthropic-version": "2023-06-01",
+  // 金鑰是使用者自己填、只送往 Anthropic，正是這個 header 允許的情境。
+  "anthropic-dangerous-direct-browser-access": "true",
+});
+const geminiHeaders = (apiKey) => ({ "x-goog-api-key": apiKey });
+
+// OpenAI 的模型清單沒有能力欄位，只能看名稱。本程式送 reasoning.effort、影像與 json_schema，
+// 需要 GPT-5 以後或 o 系列的推理模型；排除語音、即時、影像生成、搜尋等專用型號。
+const OPENAI_MODEL = /^(gpt-(?:[5-9]|\d{2,})|o\d)/;
+const OPENAI_EXCLUDE = /audio|realtime|transcribe|tts|image|search|codex|chat|deep-research|computer/;
+
+async function listOpenAI(apiKey) {
+  const j = await getJson("OpenAI", "https://api.openai.com/v1/models", openaiHeaders(apiKey));
+  return j.data
+    .filter((m) => OPENAI_MODEL.test(m.id) && !OPENAI_EXCLUDE.test(m.id))
+    .sort((a, b) => b.created - a.created)
+    .map((m) => m.id);
+}
+
+/** 本程式對 Claude 的需求：影像輸入、結構化輸出、effort high、adaptive thinking。 */
+function claudeSupports({ capabilities: c }) {
+  if (!c) return false; // 沒附能力資訊＝相容性未知，不列入；仍可用「其他」自行輸入。
+  return Boolean(
+    c.image_input?.supported &&
+      c.structured_outputs?.supported &&
+      c.effort?.high?.supported &&
+      c.thinking?.types?.adaptive?.supported,
+  );
+}
+
+async function listClaude(apiKey) {
+  const ids = [];
+  let after = null;
+  do {
+    const url = new URL("https://api.anthropic.com/v1/models");
+    url.searchParams.set("limit", "1000");
+    if (after) url.searchParams.set("after_id", after);
+    const j = await getJson("Claude", url, claudeHeaders(apiKey));
+    for (const m of j.data) if (claudeSupports(m)) ids.push(m.id);
+    after = j.has_more ? j.last_id : null;
+  } while (after);
+  return ids;
+}
+
+async function listGemini(apiKey) {
+  const ids = [];
+  let token = null;
+  do {
+    const url = new URL("https://generativelanguage.googleapis.com/v1beta/models");
+    url.searchParams.set("pageSize", "1000");
+    if (token) url.searchParams.set("pageToken", token);
+    const j = await getJson("Gemini", url, geminiHeaders(apiKey));
+    for (const m of j.models ?? []) {
+      const id = m.name.replace(/^models\//, "");
+      // 需要能產生內容、支援 thinking（送 thinking_level）；排除語音、影像生成、embedding 等專用型號。
+      if (
+        id.startsWith("gemini") &&
+        m.supportedGenerationMethods?.includes("generateContent") &&
+        m.thinking !== false &&
+        !/tts|image|embedding|audio|live/.test(id)
+      ) {
+        ids.push(id);
+      }
+    }
+    token = j.nextPageToken;
+  } while (token);
+  return ids;
+}
+
+/**
+ * 用使用者的 key 向供應商查詢候選模型 ID。只有 Claude 依 API 回報的能力精確篩選；
+ * OpenAI、Gemini 的清單無法證明與本程式的請求相容，實際能否使用以轉檔時 API 的回應為準。
+ */
+export function listModels(provider, apiKey) {
+  return PROVIDERS[provider].listModels(apiKey);
 }
 
 async function buildContentOpenAI(images) {
@@ -263,7 +349,7 @@ async function extractOpenAI(apiKey, model, images, onProgress) {
   const res = await postStream(
     "OpenAI",
     "https://api.openai.com/v1/responses",
-    { authorization: `Bearer ${apiKey}` },
+    openaiHeaders(apiKey),
     {
       model,
       max_output_tokens: MAX_OUTPUT_TOKENS,
@@ -338,12 +424,7 @@ async function extractClaude(apiKey, model, images, onProgress) {
   const res = await postStream(
     "Claude",
     "https://api.anthropic.com/v1/messages",
-    {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      // 金鑰是使用者自己填、只送往 Anthropic，正是這個 header 允許的情境。
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
+    claudeHeaders(apiKey),
     {
       model,
       max_tokens: MAX_OUTPUT_TOKENS,
@@ -393,7 +474,7 @@ async function extractGemini(apiKey, model, pdf, onProgress) {
   const res = await postStream(
     "Gemini",
     "https://generativelanguage.googleapis.com/v1beta/interactions",
-    { "x-goog-api-key": apiKey },
+    geminiHeaders(apiKey),
     {
       model,
       input: [
@@ -465,6 +546,8 @@ export const PROVIDERS = Object.freeze({
     // A4 在 175 DPI 下約 1447x2047，剛好貼齊上限，把解析度額度用滿。
     render: { maxEdge: 2048, dpi: 175 },
     extract: extractOpenAI,
+    listModels: listOpenAI,
+    listFilter: "依模型名稱篩選，能否使用以轉檔時 API 的回應為準",
   },
   claude: {
     label: "Claude",
@@ -474,6 +557,8 @@ export const PROVIDERS = Object.freeze({
     // Opus 5 高解析度視覺上限：長邊 2576px；A4 在 220 DPI 下約 1819x2573。
     render: { maxEdge: 2576, dpi: 220 },
     extract: extractClaude,
+    listModels: listClaude,
+    listFilter: "依 API 回報的能力篩選",
   },
   gemini: {
     label: "Gemini",
@@ -482,6 +567,8 @@ export const PROVIDERS = Object.freeze({
     keyUrl: "https://aistudio.google.com/apikey",
     render: null,
     extract: extractGemini,
+    listModels: listGemini,
+    listFilter: "依 API 回報的生成方式與 thinking 支援篩選，能否使用以轉檔時 API 的回應為準",
   },
 });
 
